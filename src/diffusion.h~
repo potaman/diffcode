@@ -1,0 +1,128 @@
+
+/**
+ * @file   diffusion.h
+ * @author Subramanya <subramanya@me-98-66.dhcp.ecn.purdue.edu>
+ * @date   Wed Jun 12 15:19:54 2013
+ * 
+ * @brief  This file handles the vacancy diffusion part of the problem 
+ * 
+ * 
+ */
+
+#ifndef __diffusion_h__
+#define __diffusion_h__
+
+// libmesh includes
+
+#include "libmesh/linear_implicit_system.h"
+#include "libmesh/transient_system.h"
+#include "libmesh/id_types.h"
+#include "libmesh/dirichlet_boundaries.h"
+#include "material.h"
+#include "neumann_boundary.h"
+#include "diff_code.h"  
+#include "active_region.h"
+
+
+using libMesh::EquationSystems;
+using libMesh::Gradient;
+using libMesh::LinearImplicitSystem;
+using libMesh::Number;
+using libMesh::NumericVector;
+using libMesh::Parameters;
+using libMesh::Point;
+using libMesh::SparseMatrix;
+using libMesh::System;
+using namespace::libMesh;
+
+
+class DiffCode::Diffusion: public TransientLinearImplicitSystem, 
+  public System::Assembly
+{
+ public: 
+
+  
+  /** 
+   * Constructor for the diffusion system 
+   * 
+   * @param eqSys 
+   * @param name 
+   * @param number 
+   * 
+   * @return 
+   */
+  Diffusion(EquationSystems& eqSys, 
+	    const std::string& name, 
+	    const unsigned int number) ; 
+
+
+
+  void assemble(); 
+
+
+  void reinit_lin_solver(); 
+
+
+  void add_dirichlet_boundary_condition(boundary_id_type& i, 
+					Real value) ; 
+
+  void add_neumann_boundary_condition(boundary_id_type& i,
+				      RealGradient value,
+				      Real scalar_value) ; 
+
+
+
+  
+  std::string _active_set;
+ private: 
+  bool _constrained; 
+  
+  bool _init_solve;
+  
+  std::map<boundary_id_type, DirichletBoundary> _diffusion_dirichlet_bcs; 
+  std::map<boundary_id_type, NeumannBoundary> _diffusion_neumann_bcs; 
+  
+  std::set<boundary_id_type> _dirichlet_boundary_sides; 
+  std::set<boundary_id_type> _neumann_boundary_sides; 
+
+  DiffCode& _diff_code; 
+  
+  ActiveRegion* _active_region;
+
+  void _set_init_solve(bool init); 
+  
+  bool _get_init_solve();
+  
+  
+  Real _compute_dirichlet_term(Real heaviside);
+
+  Real _compute_robin_term(Real heaviside); 
+
+  Real _compute_neumann_term(Real heaviside); 
+  
+
+  Real _compute_surface_rate(Real heaviside, 
+			     Real saturation_value, 
+			     Real actual_value) ; 
+
+
+  Real _compute_surface_saturation_value(Real heaviside, 
+					 Real mu,
+					 Real equilibrium); 
+
+
+  Real _compute_driving_force(Real heaviside, 
+			      Real pg, 
+			      Real epg);
+
+  
+
+  Number _delta_4_degree(const Number& phi);
+					
+    
+
+}; 
+
+  
+  
+#endif

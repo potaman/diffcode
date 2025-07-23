@@ -1,0 +1,84 @@
+#ifndef __neumann_boundary_h__
+#define __neumann_boundary_h__ 
+
+#include "libmesh/system.h"
+#include "libmesh/id_types.h" 
+#include "libmesh/function_base.h"
+using namespace libMesh;
+class NeumannBoundary
+{
+ public:
+  /** 
+   * Constructor
+   * 
+   * @param system  parent system where this boundary condition belongs to 
+   * @param boundary_id  boundary where this boundary condition is to be applied
+   * @param vector_condition  the vector part of this boundary condition
+   * @param scalar_condition  the scalar part of this boundary condition 
+   */
+  NeumannBoundary(
+		  boundary_id_type& boundary_id, 
+		  FunctionBase<RealGradient>& vector_condition, 
+		  FunctionBase<Real>& scalar_condition
+		  ); 
+
+  
+  /** 
+   * Sets the activity of the boundary condition
+   * 
+   */
+
+  void activate_boundary_condition(); 
+
+  /** 
+   * Deactivates the boundary condition 
+   * 
+   */
+
+  void deactivate_boundary_condition(); 
+
+
+  /** 
+   * 
+   * Checks if the boundary condition is active
+   * 
+   * @return 
+   */
+  bool is_active(); 
+
+ 
+  /** 
+   *  Gets the value of the boundary condition
+   * 
+   * @param p  Location where the boundary condtiion function is to be evaluated
+   * @param normal Normal at the location 
+   * 
+   * @return  Value of the boundary condition 
+   */
+  Real get_boundary_condition_value( const Point& p , 
+				     const Point& normal); 
+
+
+  boundary_id_type get_boundary_id(); 
+  
+ protected: 
+  
+  bool _active; 
+  ///  Boundary where this boundary condition is applied
+  boundary_id_type _boundary_id; 
+  
+ private:
+  ///  Vector condtiions applied as J.n 
+  FunctionBase<RealGradient>& _vector_condition;
+ 
+  /// Conditions that are just applied as J 
+  FunctionBase<Real>& _scalar_condition; 
+  
+  
+  
+};
+#endif // __neumann_boundary_h__
+
+
+
+

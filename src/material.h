@@ -1,0 +1,379 @@
+/**
+ * @file   Material.h
+ * @author Subramanya Sadasiva <ssadasiv@me-98-16.dhcp.ecn.purdue.edu>
+ * @date   Thu Mar 14 19:01:54 2013
+ * 
+ * @brief  Material class to store material properties. 
+ *         Has properties for various things. including any anisotropic properties and rotations. 
+ * 
+ * 
+ */
+
+
+#ifndef __material_h__
+#define __material_h__
+
+//#include "diff_code.h"
+#include "libmesh/tensor_value.h"
+#include "libmesh/vector_value.h" 
+#include "libmesh/dense_matrix.h"
+#include "libmesh/id_types.h" 
+#include "libmesh/parameters.h"
+
+
+using namespace libMesh;
+class Material
+{
+  /** 
+   * Constructor 
+   * @param name name of the material 
+   * @param number number for the material 
+   */
+  public:
+  Material(
+	   const std::string& name, 
+	   const unsigned int  number
+	   );
+  
+  
+//  Material( 
+//	   Material
+//	    ); 
+//
+
+
+  /// vector containing all the subdomains to which the particular material has been assigned 
+  std::vector<subdomain_id_type> subdomains; 
+ 
+  /** 
+   * gets the diffusivity of the material . 
+   * 
+   * 
+   * @return 
+   */
+  Real get_diffusivity(); 
+  /** 
+   * Gets the diffusivity matrix for the material 
+   * 
+   * @param tensor 
+   */
+  RealTensor get_diffusivity_tensor(); 
+
+  /** 
+   * Gets the Stiffness matrix for the material 
+   * 
+   * @param matrix 
+   */
+  DenseMatrix<Number> get_stiffness_matrix(); 
+ 
+  /** 
+   * Gets the conductivity matrix for the material  
+   * 
+   * @param tensor 
+   */
+  RealTensor get_conductivity_tensor(); 
+  
+
+  /** 
+   * This is a function for that
+   * 
+   * 
+   * @return 
+   */
+  Real get_conductivity();
+
+  
+  /** 
+   * 
+   * 
+   * 
+   * @return 
+   */
+  Real get_electromigration_param(); 
+
+
+  /** 
+   * 
+   * 
+   * 
+   * @return 
+   */
+  Real get_atomic_volume(); 
+
+
+  /** 
+   * 
+   * 
+   * 
+   * @return 
+   */
+  Real get_surface_reaction_parameter(); 
+
+
+
+  /** 
+   * 
+   * 
+   * 
+   * @return 
+   */
+  Real get_surface_strain_energy_parameter(); 
+
+  
+
+
+
+  /** 
+   * 
+   * 
+   * 
+   * @return 
+   */
+  Real get_surface_diffusivity(); 
+  
+  
+
+  /** 
+   * 
+   *  
+   * 
+   * @return 
+   */
+  Real get_surface_electromigration_param(); 
+
+
+
+  Real get_thermomigration_param(); 
+  
+  Real get_surface_thermomigration_param(); 
+
+
+  Real get_thermal_conductivity(); 
+  
+
+  Real get_thermal_mass(); 
+
+
+  Real get_heat_factor(); 
+
+  /** 
+   * 
+   * 
+   * @param strain 
+   * @param stress 
+   */
+  void get_stress(
+		  const std::vector<Real>& strain,
+		  std::vector<Real>& stress
+		  ) ;
+
+
+  
+
+  /** 
+   * Get the thermal strain for the material 
+   * 
+   * @param vector
+   * @param temperature temperature at the point 
+   * @param strain vector to fill in values into . 
+   */
+  void get_thermal_strain(const Real& temperature,
+			  const Real& temp0,
+			  std::vector<Real>& strain  ); 
+  
+
+  
+  Real get_thermal_expansivity();
+
+  Real get_surface_tension(); 
+
+  /** 
+   * @param tensor Get the concentration strain for the material 
+   */
+  void get_concentration_strain(const  std::vector<Real>& concentrations,
+				const std::vector<Real>& conc_0,
+				std::vector<Real>& strain); 
+  
+  // sters for all the functions. 
+
+  /** 
+   * Set the elasticity parameters
+   * 
+   * @param youngs_modulus 
+   * @param poissons_ratio 
+   */
+  void set_elasticity_parameters(Real youngs_modulus, 
+				 Real poissons_ratio,
+				 const int dim,
+				 bool plane_stress); 
+  
+
+  /** 
+   * Set the diffusivity of the material
+   * 
+   * @param diffusivity 
+   */
+  void set_diffusivity(Real diffusivity); 
+
+
+  /** 
+   * Set the diffusivity of the material 
+   * 
+   * @param diffusivity_tensor 
+   */
+  void set_diffusivity_tensor(RealTensor diffusivity_tensor); 
+
+  /** 
+   * Set the atomic volume of the material 
+   * 
+   * @param atomic_volume 
+   */
+  
+  void set_atomic_volume(Real atomic_volume); 
+  
+  /** 
+   *  Set the thernal conductivity of the material 
+   * 
+   * @param thermal_conductivity 
+   */
+  void set_thermal_conductivity(Real thermal_conductivity); 
+  
+  /** 
+   * Set the thermal expansivity of the material 
+   * 
+   * @param thermal_expansivity 
+   */
+  void set_thermal_expansivity(Real thermal_expansivity); 
+
+  /** 
+   * Set the conductivity of the material 
+   * 
+   * @param conductivity 
+   */
+  void set_conductivity(Real conductivity); 
+    
+  /** 
+   * Set the electromigration parameter
+   * 
+   * @param electromigration_param 
+   */
+  void set_electromigration_param(Real electromigration_param); 
+
+
+  void set_thermomigration_param(Real thermomigration_param); 
+
+  /** 
+   * Set the surface diffusivity parameter
+   * 
+   * @param surface_diffusivity 
+   */
+  void set_surface_diffusivity(Real surface_diffusivity); 
+
+
+
+  /** 
+   * Set the surface electromigration parameters
+   * 
+   * @param surface_electromigration_param 
+   */
+  void set_surface_electromigration_param(Real surface_electromigration_param); 
+  
+  
+  void set_surface_thermomigration_param(Real surface_thermomigration_param); 
+
+  
+  /** 
+   * 
+   * Set the surface strain enery parameter
+   * @param surface_strain_energy_param 
+   */
+  void set_surface_strain_energy_param(Real surface_strain_energy_param) ;
+  
+
+  /** 
+   * 
+   * Set the surface reaction parameters.
+   * @param surface_reaction_param 
+   */
+  void set_surface_reaction_param(Real surface_reaction_param) ; 
+
+  /** 
+   * 
+   * set the surface tension parameter for the solid
+   * @param surface_tension 
+   */
+  void set_surface_tension(Real surface_tension);
+  
+  void set_thermal_mass(Real thermal_mass); 
+
+  void set_heat_factor(Real heat_factor); 
+
+  
+  
+  std::string get_name();
+
+
+ private: 
+  /// Stiffness matrix for the material
+  DenseMatrix<Number> _stiffness_matrix; 
+  /// Diffusivit tensor
+  RealTensor _diffusivity_tensor; 
+
+  ///  Tensor for the conductivity 
+  RealTensor _conductivity_tensor; 
+  
+  /// Young's modulus of the material 
+  Real _youngs_modulus;
+  /// Poissons ratio of the material 
+  Real _poissons_ratio; 
+  /// Diffusivity of the material 
+  Real _diffusivity; 
+
+  /// Surface diffusivity of the material
+  Real _surface_diffusivity; 
+  
+  /// Surface electromgration parameter
+  Real _surface_electromigration_param; 
+
+  Real _surface_thermomigration_param; 
+
+  /// Surface strain  energy parameter 
+  Real _surface_strain_energy_parameter; 
+
+  ///  Surface reaction parameter 
+  Real _surface_reaction_parameter; 
+  
+  /// Surface tension parameter
+  Real _gamma;
+  
+  /// Atomic volume of the material 
+  Real _atomic_volume; 
+
+  /// Electrical conductivity of the material 
+  Real _conductivity; 
+
+  /// Thermal conductivity of the material 
+  Real _thermal_conductivity; 
+
+  /// _thermal expansivity of the material
+  Real _thermal_expansivity; 
+
+
+  Real _thermal_mass; 
+
+  Real _heat_factor; 
+  
+  /// Electromigration parameter of the material
+  Real _electromigration_param; 
+
+  Real _thermomigration_param; 
+
+  /// name for the material 
+  std::string _name; 
+  
+  /// Some index of the material
+  Real _number; 
+ 
+  
+}; 
+#endif

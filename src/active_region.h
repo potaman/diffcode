@@ -1,0 +1,209 @@
+/**
+ * @file   active_region.h
+ * @author Subramanya <ssadasiv@me-98-2.dhcp.ecn.purdue.edu>
+ * @date   Fri Oct 11 10:40:40 2013
+ * 
+ * @brief  This is a class that stores all the information for an active region of the solder . 
+ *         The information that this class stores is as follows,
+ *         1 - The name of the region / read from the abaqus file. 
+ *         2 - The Set of libmesh subdomain IDs that are related to this subdomain. 
+ *         3 - Boundary Sets corresponding to this id. 
+ *         4 - Material assignment for this id. 
+ *         5 - A reader function to read everything corresponding to this active region
+ *         6 - Initial conditions for this solder joint
+ */
+#ifndef __active_region_h__
+#define __active_region_h__
+
+#include "libmesh/id_types.h"
+#include "libmesh/vector_value.h"
+#include "libmesh/getpot.h"
+#include "diff_code.h"
+
+class DiffCode::ActiveRegion
+{
+ public:
+  /** 
+   * Constructor for the active region
+   * 
+   * @param name 
+   * @param number 
+   */
+  ActiveRegion(
+	       const std::string& name, 
+	       const unsigned int number, 
+	       DiffCode& diffcode
+	       ); 
+  
+  
+  /** 
+   * Returns if the active region is a phase field region. 
+   * 
+   * @return 
+   */
+  bool is_phase_field_region();
+  
+  /** 
+   * Reading the active region
+   * 
+   * @param input_file  This is the input file that is being read by the 
+   *           
+   */
+  void read_active_region_info(GetPot& input_file); 
+  
+  /** 
+   * 
+   * 
+   * 
+   * @return Name of the material assigned to the active region 
+   */
+  std::string get_material_name(); 
+ 
+  /** 
+   * Name of the active region 
+   * 
+   * 
+   * @return 
+   */
+  std::string get_name(); 
+
+  /** 
+   * Check if the subdomain id is included in this active region 
+   * 
+   * @param sub_id 
+   * 
+   * @return whether the subdomain id is included in the id. 
+   */
+  bool subdomain_id_inclusion(subdomain_id_type sub_id); 
+  
+
+  /** 
+   * Give the number of the active region
+   * 
+   * 
+   * @return 
+   */
+  unsigned int get_number() ;
+
+
+
+  /** 
+   * calculate the value of the void at the 
+   * 
+   * @param p  
+   * 
+   * @return 
+   */
+  Number get_phase_field_value(const Point& p);
+  
+  /** 
+   * Reads the subdomain ids into the value.
+   * 
+   * @param subdomain_ids 
+   */
+  void add_subdomain_ids();
+
+
+  /** 
+   * Returns the subdomains to the 
+   * 
+   * 
+   * @return 
+   */
+  std::set<subdomain_id_type>* get_subdomains();
+ 
+  
+ private:
+  /// Whether the region is a phase field region.
+  bool _phase_field_region;
+  /// Dimension of the problem
+  unsigned int _dim; 
+  /// Name of the active region
+  std::string _name; 
+  /// Number of the active region 
+  unsigned int _number; 
+  /// List of libmesh subdomain ids corresponding to the active region
+  std::set<subdomain_id_type> _subdomain_ids; 
+  /// Boundary names associated with the boundary set. 
+  std::set<std::string> _boundary_ids; 
+  
+
+  /// Name of the material assigned to this subdomain id
+  std::string _material; 
+  /// Number of voids related to the joint. 
+  unsigned int _n_voids; 
+ 
+  /// Structure to hold the initial values for each void 
+  struct Void
+  {
+    Point center; 
+    Point sizes;
+    Point angles;
+    TensorValue<Number> rotation_matrix; 
+  };
+  
+  std::vector<Void> _voids; 
+
+  std::vector<Number> _function_values; 
+  
+
+  Number _get_phase_field_value_2D(const Point& p, unsigned int void_number) ;
+  
+  Number _get_phase_field_value_3D(const Point& p,unsigned int void_number); 
+
+  
+  Number _get_sinusoidal_field_value(const Point& p, 
+				     const Point& o,
+				     const Real& theta, 
+				     const Real& omega, 
+				     const Real& A); 
+  
+
+
+
+  std::string _form_keys(const std::string feature); 
+
+  std::string _form_keys_for_voids(const unsigned int void_number,
+				   const std::string feature); 
+
+   
+  
+  /** 
+   * This is to construct the 2D rotation matrix 
+   * 
+   * @param alpha 
+   * 
+   * @return 
+   */
+  TensorValue<Number> _rotation_matrix_2D(const Number alpha); 
+  
+
+
+
+  /** 
+   * This is to construct the 3D rotation matrix 
+   * 
+   * @param alpha 
+   * @param beta 
+   * 
+   * @return 
+   */
+  TensorValue<Number> _rotation_matrix_3D(const Number alpha, 
+					  const Number beta,
+					  const Number gamma); 
+
+  
+
+
+  DiffCode& _diff_code; 
+ 
+
+  Point _sin_origin;
+  Real  _line_angle; 
+  Real  _sin_amp; 
+  Real  _sin_freq; 
+
+
+}; 
+
+#endif // __active_region_h__

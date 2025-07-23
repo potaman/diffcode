@@ -1,0 +1,938 @@
+// Libmesh includes
+#include <cmath>
+#include <typeinfo>
+
+#include "libmesh/quadrature_gauss.h"
+#include "libmesh/dense_matrix.h"
+#include "libmesh/dense_vector.h"
+#include "libmesh/sparse_matrix.h"
+#include "libmesh/fourth_error_estimators.h"
+#include "libmesh/dof_map.h"
+#include "libmesh/numeric_vector.h"
+#include "libmesh/periodic_boundaries.h"
+#include "libmesh/mesh.h"	  
+#include "libmesh/dense_submatrix.h"
+#include "libmesh/dense_subvector.h"
+#include "libmesh/petsc_dm_nonlinear_solver.h"
+#include "libmesh/petsc_linear_solver.h"
+#include "libmesh/linear_implicit_system.h" 
+#include "libmesh/transient_system.h"
+//Some includes for interfacing directly with petsc . 
+#include "libmesh/petsc_macro.h"
+#include "libmesh/libmesh_common.h"
+#include "libmesh/parallel.h"
+
+
+//includes for other files from my code. 
+#include "diff_code.h"
+#include "linear_cahn_hilliard.h"
+#include "material.h"
+
+//======================================================================
+// Cahn Hilliard constructor 
+//======================================================================
+DiffCode::LinearCahnHilliard::LinearCahnHilliard(EquationSystems& eqSys,
+					 const std::string& name,
+					 const unsigned int number) :
+  TransientLinearImplicitSystem(eqSys,name,number),
+  _diff_code(dynamic_cast<DiffCode&>(eqSys))
+{ 
+  
+ 
+  std::string system_name = std::string("DiffCode::linear_cahn_hilliard");
+  std::string active_region_name= _diff_code.split_system_name(
+							       system_name,
+							       name
+							       );
+  
+  /// Get the active region that you need. 
+  
+  _active_region = (*_diff_code._active_regions.find(active_region_name)).second;
+  /// This gets the mu and phi for the active subdomains. I will probably have to 
+  // add another area to set the final result variables.
+  // for(std::set<subdomain_id_type>::iterator it= _active_region->get_subdomains()->begin(); 
+  //     it !=_active_region->get_subdomains()->end();++it) 
+  //   {
+  //     libMesh::out<<*it<<std::endl;
+
+  //   }
+  add_variable("mu", FIRST,LAGRANGE,_active_region->get_subdomains());  // add variable for the chemical potential
+  add_variable("phi",FIRST,LAGRANGE,_active_region->get_subdomains());  // add variable for the phase field 
+  // Give the system an object to compute the initial.
+  attach_init_object(*this);
+  //libMesh::out<<"attaching assembly object"<<std::endl;
+  attach_assemble_object(*this); 
+
+  // These are the other things 
+  _init_solve= true;
+  _mu_constrained = false; 
+}
+//======================================================================
+// End of Cahn Hilliard constructor 
+//======================================================================
+
+
+//======================================================================
+// Cahn Hilliard iniitialization object. 
+//======================================================================
+void DiffCode::LinearCahnHilliard::initialize()
+{
+  // Instead of using project solution, which seems to be the better way to do it, 
+  // I am going to do it in a rough and ready way by using the node iterators, 
+  // I don't know if it is going to be a good idea, but lets try,
+  unsigned int sys_num = number(); 
+  unsigned int phi_num = variable_number("phi"); 
+  unsigned int mu_num = variable_number("mu"); 
+  
+  MeshBase::const_node_iterator node_it = _diff_code._mesh->local_nodes_begin(); 
+  const MeshBase::const_node_iterator node_it_end = _diff_code._mesh->local_nodes_end(); 
+  
+  for(;node_it !=node_it_end;node_it++) 
+    {
+      Node* node =*node_it; 
+      unsigned int n_comp = node->n_comp(sys_num, phi_num);
+      if (n_comp > 0) 
+	{
+	  unsigned int dof_number_phi = node->dof_number(sys_num,phi_num,0);
+	  unsigned int dof_number_mu  = node->dof_number(sys_num,mu_num, 0) ;
+	  solution->set(dof_number_phi,_active_region->get_phase_field_value((Point) *node));
+	  solution->set(dof_number_mu,0.0); 
+	}
+    }
+  solution->close(); 
+  update(); 
+  *(old_local_solution) = *(current_local_solution);
+}
+//======================================================================
+// Set the initial solve.
+//======================================================================
+void DiffCode::LinearCahnHilliard::set_init_solve(bool solved)
+{
+  _init_solve = solved; 
+}
+//======================================================================
+// Get whether the initial solve has been done
+//======================================================================
+bool DiffCode::LinearCahnHilliard::get_init_solve()
+{
+  return _init_solve;
+}
+//======================================================================
+// Set the value of beta. 
+//======================================================================
+void DiffCode::LinearCahnHilliard::set_beta_w(Real beta) 
+{
+  _beta_w = beta;
+}
+//======================================================================
+// Beginning of residual function 
+//====================================================================== 
+void DiffCode::LinearCahnHilliard::assemble()
+{
+  // Get the variable numbers. 
+  rhs->zero();
+  matrix->zero(); 
+
+  const unsigned int phi_var = variable_number("phi"); 
+  const unsigned int mu_var = variable_number("mu"); 
+ 
+  
+   // Get the name of the name of the diffusion system 
+  std::string diff_sys_name = _diff_code.form_system_name(
+							  std::string("DiffCode::diffusion"),
+							  _active_region->get_name()
+							  );
+  
+  
+  TransientLinearImplicitSystem& diff = 
+    _diff_code.get_system<TransientLinearImplicitSystem>(diff_sys_name); 
+  
+  // get the pointers to all the other systems in the world. 
+  LinearImplicitSystem& elec = 
+    _diff_code.get_system<LinearImplicitSystem>("DiffCode::elec"); 
+  
+  TransientLinearImplicitSystem& ts = 
+    _diff_code.get_system<TransientLinearImplicitSystem>("DiffCode::thermal"); 
+  
+
+
+  ExplicitSystem& stress = 
+    _diff_code.get_system<ExplicitSystem>("DiffCode::stress_system"); 
+  
+
+  
+  /// This gets the name for the other results file. that is used for 
+  /// storage of some computed fields. for the different parts
+  std::string other_res_name = _diff_code.form_system_name(
+							   std::string("DiffCode::other_results"),
+								       _active_region->get_name());
+  ExplicitSystem& other_res = 
+    _diff_code.get_system<ExplicitSystem>(other_res_name); 
+
+  
+  
+  // Solution vector for each of the systems
+  
+  const NumericVector<Number>& elec_vector = *(elec.current_local_solution);
+  const NumericVector<Number>& ts_vector   = *(ts.current_local_solution); 
+  const NumericVector<Number>& diff_vector = *(diff.current_local_solution); 
+  const NumericVector<Number>& stress_vector = *(stress.current_local_solution); 
+  
+  const NumericVector<Number>& old_vector = *(old_local_solution); 
+  const NumericVector<Number>& older_vector = *(older_local_solution); 
+  const NumericVector<Number>& other_vec   = *(other_res.current_local_solution); 
+
+
+  // Get the variables of the different systems
+ 
+  const unsigned int e_var = elec.variable_number("e"); 
+  const unsigned int conc_var = diff.variable_number("conc");   
+  const unsigned int ener_var = stress.variable_number("ener");
+  const unsigned int p_var = stress.variable_number("p");
+  const unsigned int t_var = ts.variable_number("t"); 
+
+  const unsigned int int_conc_var =other_res.variable_number("conc_int"); 
+  
+
+
+  
+  FEType fe_type = variable_type(phi_var); 
+  FEType fe_type_e = elec.variable_type(e_var); 
+  FEType fe_type_stress= stress.variable_type(ener_var); 
+  FEType fe_type_conc = diff.variable_type(conc_var); 
+  FEType fe_type_int_conc = other_res.variable_type(int_conc_var); 
+  FEType fe_type_t = ts.variable_type(t_var);
+  
+  
+
+  
+
+  AutoPtr<FEBase> fe_phi (FEBase::build(_diff_code._dim,fe_type)); 
+  AutoPtr<FEBase> fe_e (FEBase::build(_diff_code._dim,fe_type_e)); 
+  AutoPtr<FEBase> fe_ener(FEBase::build(_diff_code._dim,fe_type_stress)); 
+  AutoPtr<FEBase> fe_conc(FEBase::build(_diff_code._dim,fe_type_conc)); 
+  AutoPtr<FEBase> fe_int_conc(FEBase::build(_diff_code._dim,fe_type_int_conc));
+  AutoPtr<FEBase> fe_face(FEBase::build(_diff_code._dim,fe_type)); 
+  AutoPtr<FEBase> fe_t(FEBase::build(_diff_code._dim,fe_type_t));
+
+  QGauss qrule(_diff_code._dim,fe_type.default_quadrature_order());
+  QGauss qface(_diff_code._dim -1,fe_type.default_quadrature_order()); 
+
+  fe_phi->attach_quadrature_rule(&qrule); 
+  fe_e->attach_quadrature_rule(&qrule); 
+  fe_ener->attach_quadrature_rule(&qrule); 
+  fe_conc->attach_quadrature_rule(&qrule); 
+  fe_int_conc->attach_quadrature_rule(&qrule); 
+  fe_face->attach_quadrature_rule(&qface);
+  fe_t->attach_quadrature_rule(&qrule);
+
+  const std::vector<Real>& JxW = fe_phi->get_JxW(); 
+  
+  const std::vector<std::vector<Real> >& phi_ch = fe_phi->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi_ch = fe_phi->get_dphi(); 
+  
+  const std::vector<std::vector<Real> >& phi_e = fe_e->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi_e = fe_e->get_dphi(); 
+ 
+  const std::vector<std::vector<Real> >& phi_ener = fe_ener->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi_ener = fe_ener->get_dphi(); 
+
+  const std::vector<std::vector<Real> >& phi_conc = fe_conc->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi_conc = fe_conc->get_dphi();
+  
+  const std::vector<std::vector<Real> >& phi_int_conc = fe_int_conc->get_phi(); 
+  
+  const std::vector<Real>& JxW_face = fe_face->get_JxW();
+  const std::vector<std::vector<Real> >& phi_face = fe_face->get_phi();
+  
+
+  const std::vector<std::vector<Real> >& phi_t = fe_t->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi_t = fe_t->get_dphi(); 
+  
+
+
+  
+  const DofMap& dof_map = get_dof_map(); 
+  const DofMap& dof_map_e = elec.get_dof_map(); 
+  const DofMap& dof_map_ener = stress.get_dof_map(); 
+  const DofMap& dof_map_conc  = diff.get_dof_map(); 
+  const DofMap& dof_map_other_res = other_res.get_dof_map(); 
+  const DofMap& dof_map_t = ts.get_dof_map(); 
+  
+  
+
+
+  DenseVector<Number> Fe; 
+  
+  DenseSubVector<Number>
+    Fphi(Fe),Fmu(Fe); 
+  
+  DenseMatrix<Number> Ke; 
+  DenseSubMatrix<Number>
+    Kphiphi(Ke),Kphimu(Ke),
+    Kmuphi(Ke),Kmumu(Ke); 
+
+  std::vector<unsigned int> dof_indices;
+  std::vector<unsigned int> dof_indices_phi; 
+  std::vector<unsigned int> dof_indices_mu; 
+  
+  std::vector<unsigned int> dof_indices_e; 
+  std::vector<unsigned int> dof_indices_ener; 
+  std::vector<unsigned int> dof_indices_conc; 
+  std::vector<unsigned int> dof_indices_p; 
+  std::vector<unsigned int> dof_indices_int_conc;
+  std::vector<unsigned int> dof_indices_t; 
+  
+  const Real dt = _diff_code._dt; // Deltat  
+  const Real c = _diff_code._cnWeight; // crank nicholson parameter
+ 
+  // get an iterator for the material
+  std::map<std::string,Material>::iterator mat_it; 
+  
+  // Find the material corresponding to the active set.							   
+  std::string mat_name = _active_region->get_material_name();
+  
+  mat_it = _diff_code._materials.find(mat_name);
+  Material* mat = &(mat_it->second); 
+
+
+  const Real eps = _diff_code._eps;  // epsilon
+  const Real gamma = mat->get_surface_tension(); // surface tenstion
+  const Real M = mat->get_surface_diffusivity(); // surface mobility
+  const Real Zs = mat->get_surface_electromigration_param(); 
+  const Real Qs = mat->get_surface_thermomigration_param();
+  
+  
+  libMesh::out<<Qs<<std::endl;
+  const Real R = mat->get_surface_reaction_parameter(); 
+  const Real Es = mat->get_surface_strain_energy_parameter();
+  const Real Omega = mat->get_atomic_volume(); 
+
+  const Real scale_phi = 1.0; //eps/(gamma);
+  const Real scale_mu  =1.0; // 1.0/dt;
+
+  MeshBase::const_element_iterator el = _diff_code._mesh->active_local_elements_begin(); 
+  const MeshBase::const_element_iterator end_el = _diff_code._mesh->active_local_elements_end();  
+  
+  
+  for(;el != end_el;++el)
+    {
+      
+  //     // The assembly will only be done over the domain where the material 
+  //     // is set as an active material 
+      const Elem* elem =*el;
+      
+      subdomain_id_type sub_id = elem->subdomain_id();
+      
+      // Check for the active set and then go through the assembly process
+      if (_active_region->subdomain_id_inclusion(sub_id))
+	{
+	  //libMesh::out<<"elements!";
+	  
+   	  dof_map.dof_indices(elem,dof_indices);
+   	  dof_map.dof_indices(elem,dof_indices_phi,phi_var); 
+   	  dof_map.dof_indices(elem,dof_indices_mu,mu_var); 
+  
+   	  dof_map_e.dof_indices(elem,dof_indices_e); 
+   	  dof_map_ener.dof_indices(elem,dof_indices_ener,ener_var);
+   	  dof_map_ener.dof_indices(elem,dof_indices_p,p_var);
+	  dof_map_conc.dof_indices(elem,dof_indices_conc,conc_var); 
+	  dof_map_other_res.dof_indices(elem,dof_indices_int_conc,int_conc_var); 
+	  dof_map_t.dof_indices(elem,dof_indices_t); 
+	  
+   	  const unsigned int n_dofs = dof_indices.size(); 
+   	  const unsigned int n_dofs_ch_phi = dof_indices_phi.size(); 
+   	  const unsigned int n_dofs_ch_mu = dof_indices_mu.size(); 
+
+   	  const unsigned int n_dofs_e = dof_indices_e.size(); 
+	  const unsigned int n_dofs_ener = dof_indices_ener.size(); 
+	  const unsigned int n_dofs_conc = dof_indices_conc.size(); 
+	  const unsigned int n_dofs_int_conc = dof_indices_int_conc.size(); 
+	  const unsigned int n_dofs_t = dof_indices_t.size(); 
+
+
+ 	  fe_phi->reinit(elem); 
+ 	  fe_e->reinit(elem); 
+ 	  fe_ener->reinit(elem); 
+	  fe_conc->reinit(elem); 
+	  fe_int_conc->reinit(elem); 
+	  fe_t->reinit(elem); 
+	  
+
+ 	  Fe.resize(n_dofs); 
+ 	  Fphi.reposition(phi_var*n_dofs_ch_phi,n_dofs_ch_phi); 
+ 	  Fmu.reposition(mu_var*n_dofs_ch_mu,n_dofs_ch_mu); 
+	  
+
+	  Ke.resize(n_dofs,n_dofs); 
+	  Kphiphi.reposition(phi_var*n_dofs_ch_phi,phi_var*n_dofs_ch_phi,n_dofs_ch_phi,n_dofs_ch_phi); 
+	  Kphimu.reposition(phi_var*n_dofs_ch_phi,mu_var*n_dofs_ch_phi,n_dofs_ch_phi,n_dofs_ch_phi); 
+	  Kmuphi.reposition(mu_var*n_dofs_ch_phi,phi_var*n_dofs_ch_phi,n_dofs_ch_phi,n_dofs_ch_phi); 
+	  Kmumu.reposition(mu_var*n_dofs_ch_phi,mu_var*n_dofs_ch_phi,n_dofs_ch_phi,n_dofs_ch_phi); 
+
+	  
+  	  for( unsigned int qp = 0; qp<qrule.n_points(); qp++) 
+   	    {
+  	      Number phi_old_qp = 0;
+  	      Gradient grad_phi_old_qp(0.0,0.0,0.0);
+  	      Number phi_qp = 0;
+  	      Gradient grad_phi_qp(0.0,0.0,0.0); 
+  	      Number mu_qp = 0; 
+  	      Gradient grad_mu_qp(0.0,0.0,0.0); 	  
+  	      Number mu_old_qp = 0; 
+  	      Gradient grad_mu_old_qp(0.0,0.0,0.0); 
+
+	      Number phi_older_qp = 0; 
+	      Gradient grad_phi_older_qp(0.0,0.0,0.0);
+	      
+	      Number mu_older_qp = 0;
+	      Gradient grad_mu_older_qp = 0; 
+
+   	      Number e_qp = 0; 
+   	      Gradient grad_e_qp(0.0,0.0,0.0); 
+	      
+  	      Number conc_qp = 0; 
+  	      Gradient grad_conc_qp(0.0,0.0,0.0); 
+	      
+  	      Number ener_qp = 0; 
+  	      Gradient grad_ener_qp(0.0,0.0,0.0); 
+	      
+	      Number t_qp = 0; 
+	      Gradient grad_t_qp(0.0,0.0,0.0);
+
+
+
+	      Number int_conc_qp = 0; 
+	      Number p_qp = 0; 
+	      
+  	      for(unsigned int j=0; j<n_dofs_ch_phi; j++) 
+  		{
+  		  phi_old_qp+=phi_ch[j][qp]*old_vector(dof_indices_phi[j]);
+  		  grad_phi_old_qp+=dphi_ch[j][qp]*old_vector(dof_indices_phi[j]); 
+
+		  phi_older_qp +=phi_ch[j][qp]*older_vector(dof_indices_phi[j]); 
+		  grad_phi_older_qp +=dphi_ch[j][qp]*older_vector(dof_indices_phi[j]);
+  	
+		  mu_old_qp+=phi_ch[j][qp]*old_vector(dof_indices_mu[j]); 
+  		  grad_mu_old_qp+=dphi_ch[j][qp]*old_vector(dof_indices_mu[j]); 
+		  
+		  mu_older_qp+=phi_ch[j][qp]*older_vector(dof_indices_mu[j]); 
+  		  grad_mu_older_qp+=dphi_ch[j][qp]*older_vector(dof_indices_mu[j]); 
+		  
+		}
+	      
+	     
+ 	      for(unsigned int j=0;j<n_dofs_e;j++) 
+ 		{
+ 		  e_qp+=phi_e[j][qp]*elec_vector(dof_indices_e[j]); 
+ 		  grad_e_qp+=dphi_e[j][qp]*elec_vector(dof_indices_e[j]);
+ 		}
+	      
+	      for(unsigned int j=0; j<n_dofs_t; j++) 
+		{
+		  t_qp += phi_t[j][qp]*ts_vector(dof_indices_t[j]); 
+		  grad_t_qp +=dphi_t[j][qp]*ts_vector(dof_indices_t[j]); 
+		}
+
+
+  	      for(unsigned int j=0;j<n_dofs_conc;j++) 
+  		{
+  		  conc_qp+=phi_e[j][qp]*diff_vector(dof_indices_conc[j]); 
+  		  grad_conc_qp+=dphi_e[j][qp]*diff_vector(dof_indices_conc[j]);
+ 	  		  
+  		}
+	      
+	     
+   	      for(unsigned int j=0;j<n_dofs_ener;j++) 
+   		{
+   		  ener_qp+=phi_e[j][qp]*stress_vector(dof_indices_ener[j]); 
+   		  grad_ener_qp+=dphi_e[j][qp]*stress_vector(dof_indices_ener[j]);
+		  p_qp += phi_e[j][qp]*stress_vector(dof_indices_p[j]); 
+		}
+	      
+	      
+	      for(unsigned int j= 0; j<n_dofs_int_conc; j++) 
+		{
+		  int_conc_qp+=phi_int_conc[j][qp]*other_vec(dof_indices_int_conc[j]); 		
+		}
+	      
+	      
+
+	      
+	      
+	     
+
+
+	      Real phi_interp = 2*phi_old_qp - 1.0*phi_older_qp;
+
+	      Gradient grad_phi_interp = 2.0*grad_phi_old_qp - 1.0*grad_phi_older_qp; 
+	      Gradient grad_mu_interp  = 2.0*grad_mu_old_qp - 1.0*grad_mu_older_qp; 
+	      Real mu_interp =(phi_interp<-0.95)? 0.0: 2.0*mu_old_qp - 1.0*mu_older_qp;
+
+
+	      Real delta = _delta_4_degree(phi_interp) ; 
+	      Real M_interp = M*(delta +_diff_code._small_number)/eps; 
+	      Real MZ = M*delta/eps;
+
+	      conc_qp*=(conc_qp<0.0)?-1.0:1.0;
+	      Real mu_vac =(_init_solve)? 0.0: std::log(conc_qp) + Omega*p_qp ;
+	      //mu_vac= 0.0;
+	      
+	      
+	      Real add_velocity_rhs = -0.0*R*(delta/eps)*(mu_vac)*conc_qp;
+	      Real add_velocity_lhs = 0.0*R*(delta/eps)*conc_qp;
+	      Real add_velocity = 1.0*R*(delta/eps)*(conc_qp)*exp(mu_interp);
+	      //Real add_velocity = 1.0*R*(delta/eps)*(conc_qp);
+	      
+	      //libMesh::out<<"add_velocity_rhs "<<add_velocity_rhs<<std::endl;
+	      //libMesh::out<<"add_velocity_lhs "<<add_velocity_lhs<<std::endl;
+	      //libMesh::out<<"add_velocity "<<add_velocity<<std::endl;
+	      //libMesh::out<<"conc_qp "<<conc_qp<<std::endl;
+	      //libMesh::out<<"mu_vac "<<mu_vac<<std::endl;
+	      //libMesh::out<<"delta "<<delta<<std::endl;
+	      //libMesh::out<<"eps "<<eps<<std::endl;
+	      //libMesh::out<<"mu_interp "<<mu_interp<<std::endl;
+
+
+
+	      if (!_second_order)
+		{
+		  //		  Real mobil = M*(delta+_diff_code._small_number); 
+		  Real psi_conc_deriv_old = _get_psi_conc_deriv(phi_old_qp); 
+		  Real lhs_dphi_term = (gamma/eps)*(eps*eps + _diff_code._stabilization*dt); 
+		  Real rhs_dphi_term = (gamma/eps)*_diff_code._stabilization*dt;
+		  Real lhs_phi_term = (2.0*gamma/eps);
+		  
+
+		  for (unsigned int i=0; i<n_dofs_ch_phi;i++)
+		    {
+		      Fmu(i) +=JxW[qp]*(
+					MZ*dt*dphi_ch[i][qp]*Zs*grad_e_qp
+					+MZ*dt*dphi_ch[i][qp]*Qs*grad_t_qp
+					+phi_ch[i][qp]*phi_old_qp
+					+dt*phi_ch[i][qp]*add_velocity_rhs
+					 +dt*phi_ch[i][qp]*add_velocity
+					 );
+		      
+		      
+		      Fphi(i)+=JxW[qp]*(
+					phi_ch[i][qp]*(gamma/eps)*psi_conc_deriv_old
+					-delta*Es*phi_ch[i][qp]*ener_qp
+					+rhs_dphi_term*dphi_ch[i][qp]*grad_phi_old_qp
+					); 
+		      for (unsigned int j=0; j<n_dofs_ch_phi;j++) 
+			{
+			  Kmumu(i,j)+=JxW[qp]*(dt*M_interp*dphi_ch[i][qp]*dphi_ch[j][qp]+dt*add_velocity_lhs*phi_ch[i][qp]*phi_ch[j][qp]);
+			  
+			  Kmuphi(i,j)+=JxW[qp]*(phi_ch[i][qp]*phi_ch[j][qp]); 
+			  
+			  Kphiphi(i,j)+=JxW[qp]*(lhs_dphi_term*dphi_ch[i][qp]*dphi_ch[j][qp]
+						 +lhs_phi_term*phi_ch[i][qp]*phi_ch[j][qp]); 
+			  
+			  Kphimu(i,j)+=JxW[qp]*(-phi_ch[i][qp]*phi_ch[j][qp]); 
+			}
+		    }
+		}
+	      else
+		{
+
+		  //Real phi_interp = 1.5*phi_old_qp - 0.5*phi_older_qp  ;
+		  //Real mobil = M*std::max(1- phi_interp*phi_interp,0.0)+1e-7;
+		  //Real delta = M*std::max(1- phi_interp*phi_interp,0.0);
+		  Real psi_conc_2_deriv = _get_psi_conc_2_deriv(phi_old_qp); 
+		  Real psi_conc_deriv   = _get_psi_conc_deriv(phi_old_qp);
+
+
+		 
+
+		  Real lhs_dphi_term   = (gamma/eps)*(0.5*eps*eps + _diff_code._stabilization*dt); 
+		  Real rhs_dphi_term   = (gamma/eps)*(-0.5*eps*eps + _diff_code._stabilization*dt);
+		  Real conc_deriv_term = (gamma/eps)*(psi_conc_deriv -0.5*(2.0 + psi_conc_2_deriv)*phi_old_qp); 
+		  Real lhs_phi_term    = (gamma/eps)*0.5*(2.0 - psi_conc_2_deriv);
+
+
+		  
+		  
+		  
+
+		  for (unsigned int i=0; i<n_dofs_ch_phi; i++) 
+		    {
+		      Fmu(i) += JxW[qp]*(MZ*dt*dphi_ch[i][qp]*Zs*grad_e_qp // electromigration term
+					 +MZ*dt*dphi_ch[i][qp]*Qs*grad_t_qp
+					 +phi_ch[i][qp]*phi_old_qp
+					 +dt*phi_ch[i][qp]*add_velocity_rhs
+					 +dt*phi_ch[i][qp]*add_velocity
+					 ); // the old term
+		      
+		      Fphi(i) +=JxW[qp]*(phi_ch[i][qp]*conc_deriv_term
+					 -delta*Es*phi_ch[i][qp]*ener_qp
+					 +dphi_ch[i][qp]*rhs_dphi_term*grad_phi_old_qp
+					 ); 
+		      
+		      for (unsigned int j=0; j<n_dofs_ch_phi;j++) 
+			{
+			  Kmumu(i,j)+=JxW[qp]*(dt*M_interp*dphi_ch[i][qp]*dphi_ch[j][qp]+
+					       dt*add_velocity_lhs*phi_ch[i][qp]*phi_ch[j][qp]);
+			  
+			  Kmuphi(i,j)+=JxW[qp]*(phi_ch[i][qp]*phi_ch[j][qp]); 
+			  
+			  Kphiphi(i,j)+=JxW[qp]*(lhs_dphi_term*dphi_ch[i][qp]*dphi_ch[j][qp]
+						 +lhs_phi_term*phi_ch[i][qp]*phi_ch[j][qp]); 
+			  
+			  Kphimu(i,j)+=JxW[qp]*(-phi_ch[i][qp]*phi_ch[j][qp]); 
+			}
+		    }
+		}
+	    }
+	  if (_diff_code._contact_angle_boundary) 
+	    {
+	      
+	      for(unsigned int side=0; side<elem->n_sides(); side++)
+		{
+		  
+		  bool bc_check = (elem->neighbor(side)==NULL); 
+		  if (!bc_check) 
+		    {
+		      subdomain_id_type sub_id_neighbor = elem->neighbor(side)->subdomain_id(); 
+		      bc_check = (elem->subdomain_id()!=sub_id_neighbor); 
+		    }
+		  if (bc_check) 
+		    {
+		      
+		      std::map<boundary_id_type,CHNeumannBoundary>::iterator it_nbc; 
+		      for (it_nbc= _contact_boundary_conditions.begin(); 
+			   it_nbc!=_contact_boundary_conditions.end();
+			   ++it_nbc) 
+			{
+			  if(_diff_code._mesh->boundary_info->has_boundary_id(elem,
+									      side,
+									      it_nbc->first))
+			    {
+			      fe_face->reinit(elem,side); 
+			      CHNeumannBoundary* nbc = &(it_nbc->second); 
+			      for (unsigned int qp=0; qp<qface.n_points(); qp++) 
+				{
+				  Number phi_qp_old = 0.0;
+				  Number phi_qp_older = 0.0; 
+				  for (unsigned int i=0; i<n_dofs_ch_phi;i++)
+				    {
+				      phi_qp_old += phi_face[i][qp]*old_vector(dof_indices_phi[i]); 
+				      phi_qp_older += phi_face[i][qp]*older_vector(dof_indices_phi[i]); 
+				    }
+				  Number phi_interp = 1.5*phi_qp_old -0.5*phi_qp_older; 
+				  if (_implicit_contact_boundary)
+				    {
+				      Number lterm = nbc->implicit_bc_lhs(phi_qp_old);
+				      Number rterm = nbc->implicit_bc_rhs(phi_qp_old);
+				      for (unsigned int i=0; i<n_dofs_ch_phi;i++) 
+					{
+					  Fphi(i) +=gamma*JxW_face[qp]*phi_face[i][qp]*rterm;
+					  for (unsigned int j=0; j<n_dofs_ch_phi; j++)
+					    {
+					      Kphiphi(i,j) += gamma*JxW_face[qp]*phi_face[i][qp]*phi_face[j][qp]*lterm;
+					    }
+					}
+				    }
+				  else 
+				    {
+				      Number rterm= _interpolated?nbc->explicit_bc_rhs(phi_interp):
+					nbc->explicit_bc_rhs(phi_qp_old);
+				      for(unsigned int i=0; i<n_dofs_ch_phi;i++) 
+					Fphi(i)+=gamma*JxW_face[qp]*phi_face[i][qp]*rterm;
+				    }
+				}
+			    }
+			}
+		    }
+		}
+	    }
+	  dof_map.constrain_element_matrix_and_vector(Ke,Fe,dof_indices); 	  
+	  rhs->add_vector(Fe,dof_indices); 
+	  matrix->add_matrix(Ke,dof_indices); 
+	}
+    }
+  rhs->close();
+  matrix->close(); 
+}
+
+
+
+void DiffCode::LinearCahnHilliard::reinit_lin_solver()
+{
+  
+  PetscLinearSolver<Number>* petsc_solver = (PetscLinearSolver<Number>*) get_linear_solver(); 
+  
+  // Petsc error code object 
+  PetscErrorCode ierr; 
+ 
+  // Initialize the solver. creates the space  for the petsc
+  petsc_solver->init();
+  // Set the name of the petsc solver di
+
+  KSP solver_ksp = petsc_solver->ksp();
+  ierr =KSPSetOptionsPrefix(solver_ksp,"ch_solve_"); 
+ 
+  // Set options from the options file 
+  ierr =KSPSetFromOptions(solver_ksp); 
+ 
+  // Put the solver back into the nonlinear solver 
+  //linear_solver=petsc_solver; 
+  release_linear_solver(petsc_solver);
+
+
+}
+
+
+
+void DiffCode::LinearCahnHilliard::initial_mesh_refinement()
+{
+  unsigned int n_init = _diff_code._n_levels_init_refinement; 
+  unsigned int max_levels = _diff_code._n_levels_refinement; 
+
+ 
+  const unsigned int phi_var = variable_number("phi"); 
+  const unsigned int mu_var = variable_number("mu"); 
+  
+  // Store the current iterate in the vector  
+  // const NumericVector<Number>& old_vector = *(old_local_solution); 
+  const NumericVector<Number>& current_vector = *(current_local_solution); 
+
+
+//   // Get the variables of the different systems
+  FEType fe_type = variable_type(phi_var); 
+  AutoPtr<FEBase> fe_phi (FEBase::build(_diff_code._dim,fe_type)); 
+  QGauss qrule(_diff_code._dim,fe_type.default_quadrature_order());
+  fe_phi->attach_quadrature_rule(&qrule); 
+  
+  const std::vector<std::vector<Real> >& phi_ch = fe_phi->get_phi(); 
+  const DofMap& dof_map_ch = get_dof_map();
+  
+  std::vector<unsigned int> dof_indices_ch;
+  std::vector<unsigned int> dof_indices_ch_phi; 
+  
+  MeshBase::const_element_iterator el = _diff_code._mesh->active_local_elements_begin(); 
+  const MeshBase::const_element_iterator end_el = _diff_code._mesh->active_local_elements_end();  
+  
+
+
+  for(;el != end_el;++el)
+    {
+      Elem* elem = *el;
+      // The assembly will only be done over the domain where the material 
+      // is set as an active material 
+      
+      
+      subdomain_id_type sub_id = elem->subdomain_id();
+      if (_active_region->subdomain_id_inclusion(sub_id)) 
+	{
+	  dof_map_ch.dof_indices(elem,dof_indices_ch); 
+	  dof_map_ch.dof_indices(elem,dof_indices_ch_phi,phi_var); 
+	  
+	  const unsigned int n_dofs_ch_phi = dof_indices_ch_phi.size(); 
+
+	  fe_phi->reinit(elem);
+	  Number phi_av = 0.0; 
+	  
+	  for (unsigned int qp =0; qp<qrule.n_points();qp++)
+	    {
+	      for (unsigned int i=0; i<n_dofs_ch_phi;i++) 
+		{
+		  phi_av += phi_ch[i][qp]*current_vector(dof_indices_ch_phi[i]);
+		}
+	    }
+	  phi_av/=qrule.n_points();
+	  if ((phi_av>-0.99)&&(phi_av<0.99) &&
+	      (elem->level() < max_levels))
+	    {
+	      elem->set_refinement_flag(Elem::REFINE);
+	      //libMesh::out<<"refine!"<<std::endl;
+	    }
+	  else
+	    elem->set_refinement_flag(Elem::COARSEN);
+	}
+    }
+  // _diff_code._mesh_refinement->refine_and_coarsen_elements();
+}
+
+
+
+
+
+void DiffCode::LinearCahnHilliard::get_center_of_mass_and_volume(Point& com,
+								 Number& volume)
+{
+  
+
+  //Point xyz_com(0.0,0.0,0.0);
+  //Number vol_void = 0.0; 
+ 
+  const unsigned int phi_var = variable_number("phi"); 
+  const NumericVector<Number>& current_vector = *(current_local_solution); 
+  
+
+//   // Get the variables of the different systems
+  FEType fe_type = variable_type(phi_var); 
+  AutoPtr<FEBase> fe_phi (FEBase::build(_diff_code._dim,fe_type)); 
+  QGauss qrule(_diff_code._dim,fe_type.default_quadrature_order());
+  fe_phi->attach_quadrature_rule(&qrule); 
+  
+  const std::vector<Real>& JxW = fe_phi->get_JxW();
+  const std::vector<std::vector<Real> >& phi_ch = fe_phi->get_phi(); 
+  const std::vector<Point>& xyz_qp = fe_phi->get_xyz(); 
+
+  
+
+  const DofMap& dof_map_ch = get_dof_map();
+  
+  
+  std::vector<unsigned int> dof_indices_ch;
+  std::vector<unsigned int> dof_indices_ch_phi; 
+  
+  MeshBase::const_element_iterator el = _diff_code._mesh->active_local_elements_begin(); 
+  const MeshBase::const_element_iterator end_el = _diff_code._mesh->active_local_elements_end();  
+  
+  for(;el != end_el;++el)
+    {
+      Elem* elem = *el; 
+      subdomain_id_type sub_id = elem->subdomain_id(); 
+   
+      if (_active_region->subdomain_id_inclusion(sub_id))
+  	{
+   	  dof_map_ch.dof_indices(elem,dof_indices_ch); 
+   	  dof_map_ch.dof_indices(elem,dof_indices_ch_phi,phi_var); 
+	 
+	  
+	  
+   	  Point xyz(0.0,0.0,0.0); 
+   	  Real vol= 0.0; 
+	  
+   	  const unsigned int n_dofs_ch_phi = dof_indices_ch_phi.size(); 
+  	  fe_phi->reinit(elem); 
+   	  for (unsigned int qp =0; qp<qrule.n_points();qp++) 
+   	    {
+	      Number phi_qp = 0.0; 
+  	      for (unsigned int i=0; i<n_dofs_ch_phi;i++) 
+  		{
+  		  phi_qp +=phi_ch[i][qp]*current_vector(dof_indices_ch_phi[i]);
+  		}
+  	      Number heaviside_qp = std::max((1.0 - phi_qp)/2.0,0.0);
+  	      xyz += JxW[qp]*heaviside_qp*xyz_qp[qp];
+  	      vol += JxW[qp]*heaviside_qp;
+
+	      
+   	    }
+   	  volume += vol;
+  	  com += xyz;
+
+	}
+    }
+  // parallel_only(); 
+  // libMesh::out<<volume<<std::endl;
+  _diff_code._mesh->comm().sum(com(0)); 
+  _diff_code._mesh->comm().sum(com(1));
+  _diff_code._mesh->comm().sum(com(2)); 
+  _diff_code._mesh->comm().sum(volume); 
+  
+  com/=volume;
+}  
+
+inline Real DiffCode::LinearCahnHilliard::_get_psi_conc(const Real& phi)
+{
+  return 0.5*phi*phi*(phi*phi-3.0); 
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_psi_conv(const Real& phi)
+{
+  return 0.5*phi*phi + 0.5;
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_psi_conv_deriv(const Real& phi) 
+{
+  
+  return 2.0*phi; 
+
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_psi_conc_deriv(const Real& phi)
+{
+  return (std::abs(phi) > 1.0) ? copysignf(2.0,phi):  phi*(-phi*phi + 3.0);  
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_psi_conc_2_deriv(const Real& phi) 
+{
+ 
+  return (std::abs(phi) > 1.0) ? 0.0 :  -3.0*phi*phi+3.0;
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_psi_conv_2_deriv(const Real& phi) 
+{
+  return  (std::abs(phi) > 1.0) ? 0.0 : 2.0; 
+  
+}
+
+
+inline Real DiffCode::LinearCahnHilliard::_get_extrapolated_mobility(const Real& phi, 
+								     const Real& phi_old) 
+{
+
+  Real phi_mid = 1.5*phi - 0.5*phi_old; 
+  return std::max(1.0 - phi_mid*phi_mid,0.0)+_diff_code._small_number; 
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_sec_order_psi_deriv_rhs(const Real& phi_old) 
+{
+  Real psi_conc_deriv = _get_psi_conc_deriv(phi_old) ; 
+  Real psi_conv_2_deriv = _get_psi_conv_2_deriv(phi_old); 
+  Real psi_conc_2_deriv = _get_psi_conc_2_deriv(phi_old); 
+  return psi_conc_deriv - 0.5*phi_old*(psi_conv_2_deriv+psi_conc_2_deriv); 
+}
+
+inline Real DiffCode::LinearCahnHilliard::_get_sec_order_psi_deriv_lhs(const Real& phi_old)
+{
+  Real psi_conc_2_deriv = _get_psi_conc_2_deriv(phi_old); 
+  Real psi_conv_2_deriv = _get_psi_conv_2_deriv(phi_old); 
+  return 0.5*(psi_conv_2_deriv -psi_conc_2_deriv);  
+}
+
+
+void DiffCode::LinearCahnHilliard::shift_to_second_order()
+{
+  _second_order= true; 
+}
+
+
+inline Real DiffCode::LinearCahnHilliard::_delta_4_degree(const Real& phi) 
+{
+  return std::max((1.0 - phi)*(1.0 - phi)*(1.0+phi)*(1.0+phi),0.0);
+}
+
+
+void DiffCode::LinearCahnHilliard::add_contact_boundary_condition(const boundary_id_type& i, 
+								  const Number& contact_angle, 
+								  const Number& surface_energy)
+{
+  _contact_boundary_sides.insert(i); 
+  CHNeumannBoundary* ch_neumann_bc = new CHNeumannBoundary(i,
+							   contact_angle, 
+							   surface_energy
+							   );
+
+  _contact_boundary_conditions.insert(std::make_pair(i,*ch_neumann_bc));
+
+
+}
+
+
+void DiffCode::LinearCahnHilliard::set_implicit_contact_boundary(bool tf)
+{
+  _implicit_contact_boundary=tf; 
+  
+}
+
+void DiffCode::LinearCahnHilliard::set_interpolated_contact_boundary(bool tf)
+{
+  _interpolated = tf; 
+}
+
+
+

@@ -1,0 +1,57 @@
+#include "ch_neumann_boundary.h"
+#define PI 3.14159265359
+#define SQRT2 1.414213562373095
+#define CONST 0.94280904158206
+#define ISQRT2 0.70710678118655
+
+CHNeumannBoundary::CHNeumannBoundary(
+				     const boundary_id_type& boundary_id,
+				     const Number& contact_angle, 
+				     const Number& surface_energy):
+  _boundary_id(boundary_id),
+  _contact_angle(contact_angle*PI/180.0),
+  _surface_energy(surface_energy)
+{
+  _active=true;
+
+}
+
+void CHNeumannBoundary::activate_boundary_condition()
+{
+  _active=true;
+}
+
+void CHNeumannBoundary::deactivate_boundary_condition()
+{
+  _active=false;
+}
+
+
+bool CHNeumannBoundary::is_active()
+{
+  return _active; 
+}
+
+Number CHNeumannBoundary::implicit_bc_rhs(const Number& phi_qp )
+{
+  return  ISQRT2*std::cos(_contact_angle)*std::max((1.0+phi_qp*phi_qp),0.0);
+}
+
+
+Number CHNeumannBoundary::implicit_bc_lhs(const Number& phi_qp)
+{
+  return 2.0*ISQRT2*std::cos(_contact_angle)*phi_qp;
+}
+
+Number CHNeumannBoundary::explicit_bc_rhs(const Number& phi_qp)
+{
+
+  return ISQRT2*std::cos(_contact_angle)*std::max((1.0-phi_qp*phi_qp),0.0); 
+}
+
+
+
+
+
+
+

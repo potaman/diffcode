@@ -1,0 +1,623 @@
+/**
+ * @file   diffusion.C
+ * @author Subramanya <ssadasiv@me-98-66.dhcp.ecn.purdue.edu>
+ * @date   Tue Jun 25 10:02:49 2013
+ * 
+ * @brief  Implementation of the diffusion solver for the system. 
+ *         At present only considering the vacancy diffusion. 
+ * 
+ */
+
+
+#include "diffusion.h" 
+
+
+
+
+#include "libmesh/parameters.h"
+#include "libmesh/boundary_info.h"
+#include "libmesh/numeric_vector.h"
+#include "libmesh/sparse_matrix.h"
+#include "libmesh/dof_map.h"
+#include "libmesh/dense_matrix.h"
+#include "libmesh/dense_vector.h"
+#include "libmesh/dense_submatrix.h"
+#include "libmesh/dense_subvector.h" 
+#include "libmesh/quadrature_gauss.h"
+#include "libmesh/mesh.h"
+
+#include "libmesh/fe.h" 
+#include "libmesh/nonlinear_implicit_system.h"	  
+
+#include "libmesh/petsc_macro.h"
+#include "libmesh/libmesh_common.h"
+#include "libmesh/petsc_linear_solver.h" 
+#include "libmesh/parallel.h"
+#include "libmesh/transient_system.h"
+#include "libmesh/linear_implicit_system.h" 
+#include "libmesh/const_function.h"
+
+
+
+//=================================================================================
+// Constructor for the Diffusion  solver. 
+//=================================================================================
+
+DiffCode::Diffusion::Diffusion(EquationSystems& eqSys, 
+			       const std::string& name, 
+			       const unsigned int number):
+  TransientLinearImplicitSystem(eqSys,name,number), 
+  _diff_code(dynamic_cast<DiffCode&>(eqSys))
+{
+  std::string system_name = std::string("DiffCode::diffusion"); 
+  std::string active_region_name = _diff_code.split_system_name(
+								system_name,
+								name
+						     ); 
+  _active_region =(*_diff_code._active_regions.find(active_region_name)).second; 
+  add_variable("conc",FIRST, LAGRANGE,_active_region->get_subdomains()); 
+  attach_assemble_object(*this);
+  _constrained=false; 
+  _init_solve= true; 
+}
+
+///=================================================================================
+/// Add dirichlet boundary condition for the solver. 
+///=================================================================================
+void DiffCode::Diffusion::add_dirichlet_boundary_condition(boundary_id_type& i, 
+							   Real value)
+{
+
+  // Insert dirichlet boundary condition side into the solver. 
+  _dirichlet_boundary_sides.insert(i); 
+ 
+  // Create a function for the boundary condition... At present only constant. 
+  FunctionBase<Real>* bc_func = new ConstFunction<Real>(value); 
+  // Create the set of sides over which the current boundary condition needs to be applied. 
+  std::set<boundary_id_type> bc_sides; 
+  bc_sides.insert(i) ; 
+
+  // Create the vector over which the boundary condition is to be applied. 
+  std::vector<unsigned int> variables(1); 
+  variables[0] = variable_number("conc"); 
+
+  // Create the boundary condition. 
+  DirichletBoundary* dbc = new DirichletBoundary(bc_sides, 
+						 variables, 
+						 bc_func) ; 
+
+  //Insert the boundary condition ito the set of boundary condiiton. 
+  // this does not seem to be needed. need to figure out what to do . 
+  _diffusion_dirichlet_bcs.insert(std::make_pair(i,*dbc));
+
+  get_dof_map().add_dirichlet_boundary((*dbc)); 
+  // This sets that the code is constrained. 
+  _constrained =true;
+  
+}
+//
+//
+//
+//
+///=================================================================================
+/// Add neumann boundary condition 
+///=================================================================================
+//
+void DiffCode::Diffusion::add_neumann_boundary_condition(boundary_id_type& i, 
+							 RealGradient vector_value,
+							 Real value ) 
+ {
+
+   // Insert the boundary condition sides into the neumann boundary condition set. 
+   _neumann_boundary_sides.insert(i); 
+   // Create the funcition for the boundary condition,
+   FunctionBase<Real>* bc_func = new ConstFunction<Real>(value);
+   // Create the function for the boundary condition
+   FunctionBase<RealGradient>* bc_vec_func = new ConstFunction<RealGradient>(vector_value);   
+   // Create a Neumann Boundary object
+   NeumannBoundary* neumann_bc = new NeumannBoundary(i, 
+						      *bc_vec_func,
+						      *bc_func) ; 
+   
+   // Insert this into the map of boundary conditions. 
+   _diffusion_neumann_bcs.insert(std::make_pair(i,*neumann_bc));
+  
+ }
+
+///=================================================================================
+/// Reinitialize the linear solver for this.  
+///=================================================================================
+
+
+
+
+void DiffCode::Diffusion::reinit_lin_solver()
+{
+  // AutoPtr<PetscLinearSolver<Number> > petsc_solver = 
+  //   AutoPtr<PetscLinearSolver<Number> > (new PetscLinearSolver<Number> ()); 
+
+  PetscLinearSolver<Number>* petsc_solver = (PetscLinearSolver<Number>*) get_linear_solver(); 
+  
+  // Petsc error code object 
+  PetscErrorCode ierr; 
+ 
+  // Initialize the solver. creates the space  for the petsc
+  petsc_solver->init();
+  // Set the name of the petsc solver 
+
+  KSP solver_ksp = petsc_solver->ksp();
+  ierr =KSPSetOptionsPrefix(solver_ksp,"diff_solve_"); 
+ 
+  // Set options from the options file 
+  ierr =KSPSetFromOptions(solver_ksp); 
+ 
+  // Put the solver back into the nonlinear solver 
+  //linear_solver=petsc_solver; 
+  release_linear_solver(petsc_solver);
+
+}
+
+//
+///=================================================================================
+/// Assembly routine. 
+///=================================================================================
+
+void DiffCode::Diffusion::assemble() 
+{
+
+
+  rhs->zero();
+  matrix->zero();
+  const unsigned int dim = _diff_code._dim; 
+
+
+
+ Real small_number = _diff_code._small_number; 
+ 
+
+
+ std::string ch_sys_name = _diff_code.form_system_name("DiffCode::linear_cahn_hilliard",
+						       _active_region->get_name());
+
+
+ std::string ores_sys_name = _diff_code.form_system_name("DiffCode::other_results",
+						     _active_region->get_name()); 
+
+ 
+
+ std::string init_conc_name = _diff_code.form_system_name("DiffCode::init_conc",
+							  _active_region->get_name()); 
+ 
+ 
+ 
+ TransientLinearImplicitSystem& ch = 
+   _diff_code.get_system<TransientLinearImplicitSystem>(ch_sys_name); 
+
+ LinearImplicitSystem& elec = 
+   _diff_code.get_system<LinearImplicitSystem>("DiffCode::elec"); 
+
+ LinearImplicitSystem& init_conc = 
+   _diff_code.get_system<LinearImplicitSystem>(init_conc_name); 
+ 
+ ExplicitSystem& stress = 
+   _diff_code.get_system<ExplicitSystem>("DiffCode::stress_system"); 
+ 
+ ExplicitSystem& other_res = 
+   _diff_code.get_system<ExplicitSystem>(ores_sys_name); 
+ 
+
+ ExplicitSystem& ts= 
+   _diff_code.get_system<TransientImplicitSystem>("DiffCode::thermal"); 
+ 
+ 
+
+ const NumericVector<Number>& ch_vector = *(ch.current_local_solution); 
+ const NumericVector<Number>& ch_vector_old = *(ch.old_local_solution); 
+ 
+ const NumericVector<Number>& conc_vector_old = *(old_local_solution); 
+ const NumericVector<Number>& conc_vector_older=*(older_local_solution); 
+
+ const NumericVector<Number>& e_vector = *(elec.current_local_solution); 
+ const NumericVector<Number>& stress_vector = *(stress.current_local_solution); 
+ const NumericVector<Number>& other_vec     = *(other_res.current_local_solution); 
+
+ const NumericVector<Number>& ts_vector = *(ts.current_local_solution); 
+ const NumericVector<Number>& init_vector = *(init_conc.current_local_solution); 
+
+
+ 
+ const unsigned int conc_var = variable_number("conc"); 
+ const unsigned int phi_var = ch.variable_number("phi"); 
+ const unsigned int mu_var = ch.variable_number("mu"); 
+ const unsigned int init_var = init_conc.variable_number("init_conc"); 
+
+ 
+ const unsigned int e_var = elec.variable_number("e"); 
+ const unsigned int p_var = stress.variable_number("p"); 
+ const unsigned int sener_var = stress.variable_number("ener"); 
+ const unsigned int int_conc_var = other_res.variable_number("conc_int");
+ const unsigned int ts_var = ts.variable_number("t"); 
+
+
+ const DofMap& dof_map_conc = get_dof_map(); 
+ const DofMap& dof_map_ch  = ch.get_dof_map(); 
+ const DofMap& dof_map_e   = elec.get_dof_map(); 
+ const DofMap& dof_map_stress = stress.get_dof_map(); 
+ const DofMap& dof_map_other_res = other_res.get_dof_map();  
+ const DofMap& dof_map_t = ts.get_dof_map(); 
+ const DofMap& dof_map_init_conc = init_conc.get_dof_map(); 
+
+
+ std::vector<unsigned int> dof_indices_conc; 
+ std::vector<unsigned int> dof_indices_ch_phi; 
+ std::vector<unsigned int> dof_indices_ch_mu; 
+ std::vector<unsigned int> dof_indices_stress_p; 
+ std::vector<unsigned int> dof_indices_stress_sener;
+ std::vector<unsigned int> dof_indices_e; 
+ std::vector<unsigned int> dof_indices_int_conc; 
+ std::vector<unsigned int> dof_indices_t; 
+ std::vector<unsigned int> dof_indices_init_conc; 
+ 
+
+
+ FEType fe_conc = variable_type(conc_var); 
+ FEType fe_e = elec.variable_type(e_var); 
+ FEType fe_ch = ch.variable_type(phi_var); 
+ FEType fe_stress = stress.variable_type(p_var);
+ FEType fe_int_conc = other_res.variable_type(int_conc_var); 
+ FEType fe_t = ts.variable_type(ts_var); 
+ 
+
+
+ AutoPtr<FEBase> fe_base_e(FEBase::build(dim, fe_e)); 
+ AutoPtr<FEBase> fe_base_conc(FEBase::build(dim, fe_conc)); 
+ AutoPtr<FEBase> fe_base_ch(FEBase::build(dim,fe_ch)); 
+ AutoPtr<FEBase> fe_base_stress(FEBase::build(dim,fe_stress)); 
+ AutoPtr<FEBase> fe_base_int_conc(FEBase::build(dim,fe_int_conc)); 
+ AutoPtr<FEBase> fe_base_t(FEBase::build(dim,fe_t)); 
+ 
+			   
+ 
+ AutoPtr<FEBase> fe_base_surf_conc(FEBase::build(dim, fe_conc)); 
+
+
+
+ QGauss q_bulk(dim,fe_conc.default_quadrature_order()); 
+ QGauss q_face(dim-1,fe_conc.default_quadrature_order()); 
+
+ fe_base_e->attach_quadrature_rule(&q_bulk); 
+ fe_base_conc->attach_quadrature_rule(&q_bulk); 
+ fe_base_stress->attach_quadrature_rule(&q_bulk); 
+ fe_base_ch->attach_quadrature_rule(&q_bulk); 
+ fe_base_int_conc->attach_quadrature_rule(&q_bulk); 
+ fe_base_t->attach_quadrature_rule(&q_bulk);
+
+ fe_base_surf_conc->attach_quadrature_rule(&q_face); 
+
+
+
+ const std::vector<Real>& JxW = fe_base_conc->get_JxW(); 
+ const std::vector<std::vector<Real> >&  phi_conc = fe_base_conc->get_phi(); 
+ const std::vector<std::vector<Real> >&  phi_ch = fe_base_ch->get_phi(); 
+ const std::vector<std::vector<Real> >&  phi_e = fe_base_e->get_phi(); 
+ const std::vector<std::vector<Real> >&  phi_stress = fe_base_stress->get_phi(); 
+ const std::vector<std::vector<Real> >&  phi_int_conc = fe_base_int_conc->get_phi(); 
+ const std::vector<std::vector<Real> >&  phi_t = fe_base_t->get_phi(); 
+ 
+
+ const std::vector<std::vector<RealGradient> >& dphi_conc = fe_base_conc->get_dphi(); 
+ const std::vector<std::vector<RealGradient> >& dphi_ch = fe_base_ch->get_dphi(); 
+ const std::vector<std::vector<RealGradient> >& dphi_e = fe_base_e->get_dphi(); 
+ const std::vector<std::vector<RealGradient> >& dphi_stress = fe_base_stress->get_dphi(); 
+ const std::vector<std::vector<RealGradient> >& dphi_t = fe_base_t->get_dphi(); 
+  
+
+ const std::vector<Real>& JxW_surf = fe_base_surf_conc->get_JxW(); 
+ const std::vector<std::vector<Real> >& phi_conc_surf = fe_base_surf_conc->get_phi(); 
+ const std::vector<Point>& xyz_surf = fe_base_surf_conc->get_xyz(); 
+ const std::vector<Point>& norm_surf = fe_base_surf_conc->get_normals(); 
+
+
+ 
+ 
+ MeshBase::const_element_iterator el = 
+   _diff_code._mesh->active_local_elements_begin(); 
+ const MeshBase::const_element_iterator el_end = 
+   _diff_code._mesh->active_local_elements_end(); 
+
+ std::map<boundary_id_type,NeumannBoundary>::iterator it_nbc; 
+ DenseVector<Number> Fe; 
+ DenseMatrix<Number> Ke; 
+
+ 
+  // get an iterator for the material
+  std::map<std::string,Material>::iterator mat_it; 
+  
+  // Find the material corresponding to the active set.
+  // subdomain_id_type active_sub_id = _diff_code._mesh->get_id_by_name(_diff_code._active_set); 
+  std::string mat_name = _active_region->get_material_name(); 
+  
+  mat_it = _diff_code._materials.find(mat_name);
+  Material* mat = &(mat_it->second); 
+ 
+  Real Z = mat->get_electromigration_param(); 
+  Real Omega  = mat->get_atomic_volume();
+  Real D = mat->get_diffusivity();  
+  Real R = mat->get_surface_reaction_parameter(); 
+  Real gamma = mat->get_surface_tension(); 
+  Real k = _diff_code._cnWeight; 
+  Real eps = _diff_code._eps; 
+  Real dt  = _diff_code._dt;
+  Real q = mat->get_thermomigration_param(); 
+  
+
+  RealTensor diffT = mat->get_diffusivity_tensor(); 
+  
+  
+ 
+ for (;el!= el_end;++el) 
+   {
+     const Elem* elem = *el; 
+     subdomain_id_type sub_id = elem->subdomain_id(); 
+     
+     if (_active_region->subdomain_id_inclusion(sub_id)) 
+	{
+	  // Get the degrees of freedom.. 
+	  dof_map_conc.dof_indices(elem,dof_indices_conc); 
+	  dof_map_ch.dof_indices(elem,dof_indices_ch_phi,phi_var); 
+	  dof_map_ch.dof_indices(elem,dof_indices_ch_mu,mu_var); 
+	  dof_map_e.dof_indices(elem,dof_indices_e); 
+	  dof_map_stress.dof_indices(elem,dof_indices_stress_p,p_var); 
+	  dof_map_stress.dof_indices(elem,dof_indices_stress_sener,sener_var); 
+	  dof_map_other_res.dof_indices(elem,dof_indices_int_conc,int_conc_var); 
+	  dof_map_t.dof_indices(elem,dof_indices_t); 
+	  dof_map_init_conc.dof_indices(elem,dof_indices_init_conc); 
+
+	  fe_base_e->reinit(elem); 
+	  fe_base_conc->reinit(elem); 
+	  fe_base_stress->reinit(elem); 
+	  fe_base_ch->reinit(elem); 
+	  fe_base_int_conc->reinit(elem); 
+	  fe_base_t->reinit(elem); 
+
+	  unsigned int n_dofs_conc   = dof_indices_conc.size(); 
+	  unsigned int n_dofs_ch     = dof_indices_ch_phi.size(); 
+	  unsigned int n_dofs_stress = dof_indices_stress_p.size(); 
+	  unsigned int n_dofs_e      = dof_indices_e.size(); 
+	  unsigned int n_dofs_int_conc= dof_indices_int_conc.size(); 
+	  unsigned int n_dofs_t = dof_indices_t.size(); 
+
+
+	  Ke.resize(n_dofs_conc,n_dofs_conc); 
+	  Fe.resize(n_dofs_conc);
+	  
+	  for (unsigned int qp=0; qp<q_bulk.n_points(); qp++)
+	    {
+	      Real phi_qp = 0.0;
+	      Real phi_old_qp = 0.0; 
+	      RealGradient grad_phi_qp(0.0,0.0,0.0); 
+	      RealGradient grad_phi_old_qp(0.0,0.0,0.0); 
+	  
+	      Real mu_qp = 0.0; 
+	      Real mu_old_qp = 0.0; 
+	      RealGradient grad_mu_qp(0.0,0.0,0.0); 
+	      RealGradient grad_mu_old_qp(0.0,0.0,0.0); 
+
+
+	      Real p_qp = 0.0; 
+	      RealGradient grad_p_qp(0.0,0.0,0.0); 
+
+	      Real sener_qp = 0.0; 
+	      RealGradient grad_sener_qp(0.0,0.0,0.0); 
+
+
+	      Real conc_old_qp = 0.0; 
+	      RealGradient grad_conc_old_qp(0.0,0.0,0.0); 
+
+	      Real e_qp = 0.0; 
+	      RealGradient grad_e_qp(0.0,0.0,0.0);
+
+	      Real int_conc_qp = 0.0; 
+	      
+	      Real t_qp = 0.0; 
+	      RealGradient grad_t_qp(0.0,0.0,0.0); 
+
+	      
+
+	      for (unsigned int i=0; i<n_dofs_ch; i++) 
+		{
+		  phi_qp+=phi_ch[i][qp]*ch_vector(dof_indices_ch_phi[i]);
+		  phi_old_qp+=phi_ch[i][qp]*ch_vector_old(dof_indices_ch_phi[i]);
+
+		  mu_qp+= phi_ch[i][qp]*ch_vector(dof_indices_ch_mu[i]); 
+		  mu_old_qp+= phi_ch[i][qp]*ch_vector_old(dof_indices_ch_mu[i]); 
+
+		  grad_phi_qp+=dphi_ch[i][qp]*ch_vector(dof_indices_ch_phi[i]); 
+		  grad_phi_old_qp+=dphi_ch[i][qp]*ch_vector_old(dof_indices_ch_phi[i]); 
+		  grad_mu_qp+=dphi_ch[i][qp]*ch_vector(dof_indices_ch_mu[i]); 
+		  grad_mu_old_qp+=dphi_ch[i][qp]*ch_vector_old(dof_indices_ch_mu[i]); 
+		}
+
+	      for (unsigned int i=0; i<n_dofs_t;i++) 
+		{
+		  
+		  t_qp += phi_t[i][qp]*ts_vector(dof_indices_t[i]); 
+		  grad_t_qp+=dphi_t[i][qp]*ts_vector(dof_indices_t[i]);
+
+		}
+	      
+
+	      for (unsigned int i=0; i<n_dofs_stress; i++)
+		{
+		  p_qp += phi_stress[i][qp]*stress_vector(dof_indices_stress_p[i]); 
+		  grad_p_qp += dphi_stress[i][qp]*stress_vector(dof_indices_stress_p[i]); 
+	      
+	      
+		  sener_qp+= phi_stress[i][qp]*stress_vector(dof_indices_stress_sener[i]); 
+		  grad_sener_qp+= dphi_stress[i][qp]*stress_vector(dof_indices_stress_sener[i]); 
+		}
+	  
+	    
+	      for (unsigned int i=0; i<n_dofs_e; i++) 
+		{
+		  e_qp += phi_e[i][qp]*e_vector(dof_indices_e[i]); 
+		  grad_e_qp += dphi_e[i][qp]*e_vector(dof_indices_e[i]); 
+		}
+	  
+	      for(unsigned int i=0; i<n_dofs_conc; i++) 
+		{
+		  conc_old_qp += phi_e[i][qp]*conc_vector_old(dof_indices_conc[i]); 
+		  grad_conc_old_qp += dphi_e[i][qp]*conc_vector_old(dof_indices_conc[i]); 
+		}
+	      if (_get_init_solve()) 
+		{
+		  conc_old_qp*=0.0; 
+		  grad_conc_old_qp*=0.0; 
+		  
+		  for(unsigned int i=0; i<n_dofs_conc; i++) 
+		    {
+		      conc_old_qp += phi_e[i][qp]*init_vector(dof_indices_init_conc[i]); 
+		      grad_conc_old_qp += dphi_e[i][qp]*init_vector(dof_indices_init_conc[i]); 
+		    }
+		}
+	      
+
+	      for (unsigned int i=0; i<n_dofs_int_conc;i++) 
+		{
+		  int_conc_qp += phi_int_conc[i][qp]*other_vec(dof_indices_int_conc[i]); 
+		}
+
+	      //Compute the elements of the matrix
+	      //  Real conc_exp     = std::exp(mu_qp-Omega*p_qp) ; 
+	      // Real conc_exp_old = std::exp(mu_old_qp - Omega*p_qp) ; 
+	      Real dmu_dconc = 1.0/conc_old_qp; 
+	      Real delta  = _delta_4_degree(phi_qp); 
+	  
+	      Real heaviside = std::max((1.0+phi_qp)/2.0,0.0) + small_number; 
+	      Real heaviside_u = std::max((1.0+phi_qp)/2.0,0.0) ;
+	      Real heaviside_old = std::max((1.0+phi_old_qp)/2.0,0.0) +small_number;
+	  
+	      conc_old_qp*=(conc_old_qp < 0.0)?-1.0:1.0;
+	      conc_old_qp=(phi_qp<-0.9)?1.0:conc_old_qp;
+     
+	      Real mu_const_lhs = 2.0*R*(delta/eps)*(std::log(conc_old_qp)+ mu_qp + 1.0);
+              Real mu_const_rhs = 2.0*R*(delta/eps)*(conc_old_qp);
+
+	      Real delta_phidt = heaviside - heaviside_old; 
+	      
+	      Real normal_p  = grad_p_qp*grad_phi_qp;
+	      normal_p /= grad_phi_qp.size_sq(); 
+	      normal_p *= delta_phidt; 
+	      normal_p *= ((std::abs(phi_qp))<0.95)? 1.0:0.0; 
+
+	      Real correction = 0.0; 
+		
+
+
+	      RealTensor Diff = heaviside*diffT;
+	      RealTensor Diff2 = heaviside_u*diffT;
+	      //      Omega*=0.0;
+	      
+	      for (unsigned int i=0; i<n_dofs_conc; i++) 
+		for(unsigned int j=0; j<n_dofs_conc; j++) 
+		  {
+		    Ke(i,j)+= JxW[qp]*( phi_conc[i][qp]*phi_conc[j][qp]*(2.0*heaviside-heaviside_old)
+					+ dt*(dphi_conc[i][qp]*(Diff*dphi_conc[j][qp])
+						  + dphi_conc[i][qp]*phi_conc[j][qp]*(Diff2*(Z*grad_e_qp
+						  					     -Omega*grad_p_qp
+											     +q*grad_t_qp)
+										      )
+					      +(mu_const_lhs + normal_p)*phi_conc[i][qp]*phi_conc[j][qp]
+					      
+					      )
+					);		  
+		      }
+	      for (unsigned int i=0; i<n_dofs_conc;i++) 
+		{
+		  Fe(i)+=  JxW[qp]*(phi_conc[i][qp]*heaviside*conc_old_qp 
+				    +phi_conc[i][qp]*dt*(mu_const_rhs)
+				    );
+		}
+
+	    }
+
+	  // for (unsigned int i=0; i<n_dofs_conc;i++) 
+	  // Go over the sides and apply the flux boundary conditions . I am hoping against hope
+	  // that the thing can apply dirichlet boundary conditions over the internal 
+	  // elements is possible. 
+	  // For this one the neumann boundary condition is different. and instead of checking if the 
+	  // adjacent element is null, we need to check if the adjacent element has the same subdomain name 
+	  // as the current one. 
+	  
+	  for(unsigned int side=0; side<elem->n_sides(); side++) 
+	    {
+	      // Checking if the adjacent element does not belong to the same subdomain ID.. 
+	      bool bc_check = (elem->neighbor(side)==NULL);
+	      if (!bc_check)
+		{
+		  subdomain_id_type sub_id_neighbor = elem->neighbor(side)->subdomain_id()  ;
+		 
+		  bc_check = (sub_id != sub_id_neighbor) ; 
+		}
+	      if (bc_check) 
+		{
+		  std::map<boundary_id_type,NeumannBoundary>::iterator it_nbc; 
+		  for(it_nbc=_diffusion_neumann_bcs.begin(); 
+		      it_nbc!=_diffusion_neumann_bcs.end(); 
+		      ++it_nbc)
+		    {
+		      if (_diff_code._mesh->boundary_info->has_boundary_id(elem,side,it_nbc->first))
+			{
+			  fe_base_surf_conc->reinit(elem,side);
+			  NeumannBoundary* nbc = &(it_nbc->second); 
+			  for(unsigned int qp = 0; qp<q_face.n_points(); qp++) 
+			    {
+			      Real val = nbc->get_boundary_condition_value(xyz_surf[qp], 
+									   norm_surf[qp]); 
+			      for (unsigned int i=0; i<n_dofs_conc; i++) 
+				Fe(i)+=JxW_surf[qp]*val*phi_conc_surf[i][qp];
+			      
+			    }// for(unsigned int qp = 0; qp<q_face.n_points(); qp++) 
+
+			}
+		      
+		    }// for(it_nbc=_diffusion_neumann_bcs.begin(); 
+		  
+		  
+		}
+	      
+	      
+	    }// for(unsigned int side=0; side<elem->n_sides(); side++) 
+	  
+	  dof_map_conc.heterogenously_constrain_element_matrix_and_vector(Ke,Fe,dof_indices_conc); 
+	  matrix->add_matrix(Ke, dof_indices_conc); 
+	  rhs->add_vector(Fe,dof_indices_conc); 
+	  
+	}
+   }// for (;el!= el_end;++el) 
+     
+     
+ matrix->close(); 
+ rhs->close(); 
+ if(_get_init_solve())
+   _set_init_solve(false);
+
+}
+
+void DiffCode::Diffusion::_set_init_solve(bool init)
+{
+  _init_solve = init;
+}
+
+bool  DiffCode::Diffusion::_get_init_solve()
+{
+  return _init_solve; 
+}
+
+
+inline Number DiffCode::Diffusion::_delta_4_degree(const Number& phi)
+{
+  return std::max((1.0 - phi)*(1.0 - phi)*(1.0+phi)*(1.0+phi),0.0);
+}
+
+

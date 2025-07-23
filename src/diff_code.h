@@ -1,0 +1,570 @@
+/**
+ * @file   diff_code.h
+ * @author Subramanya Sadasiva <potaman@potax>
+ * @date   Sun Mar 10 23:15:22 2013
+ * 
+ * @brief  Base class for the electromigration code. 
+ * 
+ * This is the base class for the electromigration code. 
+ * All other classes are declared here. Reads the 
+ * input file, handles output etc. 
+ * Same as the other code. 
+ * getting rid of abaqus stuff for quicker use. 
+ * As I think the mesh generation meshes are faster. 
+ */
+
+
+
+#ifndef __diff_code_h__
+#define __diff_code_h__
+
+//Libmesh Includes 
+#include  <fstream> 
+#include <iostream>
+
+
+
+#include "libmesh/equation_systems.h"
+#include "libmesh/mesh.h"
+#include "abaqus_io.h"
+
+
+#include "libmesh/exodusII_io.h"
+#include "libmesh/mesh_refinement.h"
+
+#include "libmesh/libmesh_common.h"
+#include "libmesh/error_vector.h"
+#include "libmesh/kelly_error_estimator.h"
+#include "libmesh/id_types.h"
+#include "material.h"
+
+
+
+#define PI 3.14159265358979323846264338327950
+
+// Libmesh namespaces 
+using libMesh::EquationSystems; 
+using libMesh::ExodusII_IO; 
+using libMesh::MeshRefinement; 
+using libMesh::Point; 
+using libMesh::Gradient;
+using libMesh::Real; 
+using libMesh::Mesh; 
+using libMesh::Number;
+
+
+using namespace libMesh;
+class DiffCode : public EquationSystems
+{
+ public:
+  /** 
+   * Creates the problem object
+   * 
+   * @param b takes a pointer to the pointer  
+   */
+  static void Create(DiffCode** b,const Parallel::Communicator& comm_in);
+  
+  /** 
+   * Destroys the problem object 
+   * 
+   * @param b takes a pointer to the pointer. 
+   */
+  static void Destroy(DiffCode** b);
+ 
+  /** 
+   * Constructor for the object. 
+   * 
+   * @param m pointer to a mesh object 
+   * 
+   * @return Diffcode object
+   */
+  DiffCode(Mesh* m);
+  
+  /** 
+   * 
+   * Destructor for the object. 
+   * 
+   * @return destructor for the object. this implementation is important
+   */
+  ~DiffCode()
+  {
+    // delete _meshRefinement;
+  };
+
+  /** 
+   * 
+   * Gets whether the system has to output anythin 
+   * 
+   * @return 
+   */
+  bool verbose()      { return _verbose;}
+ 
+  /**
+   * @return Gets the system dt from the initial point 
+   */
+
+  Real dt0()          { return _dt0;}
+
+  /** 
+   * @return Gets the current time step 
+   */
+
+  Real dt()           { return _dt;}
+
+  /** 
+   * output the system parameters 
+   * 
+   */
+  void viewParameters(); 
+
+  /** 
+   * Initialize the system, I think this calls init on all the other systems
+   * inside this one 
+   * 
+   */
+
+  void init();
+
+  /** 
+   * Runs one step of the simulation, advances time by dt. 
+   * 
+   * @param dt timestep to advance by 
+   */
+
+  void step(const Real& dt = -1.0);
+
+  /** 
+   * Outputs things to the exodusII or vtk files. 
+   * this uses the other equations systems object for 
+   * output of the stime steps. 
+   * @param timestep Current step number. 
+   * @param t  Current system time. 
+   * @param o_t Current output time. 
+   * @param force Whether output is to be forced even if there 
+   * is no need. for first and last time steps
+   */
+  
+  void output(int timestep, const Real& t, Real& o_t, bool force = false);
+  
+  /** 
+   * Run the time steps. This is the main function to run the code. 
+   * 
+   */
+  void run();
+
+  /** 
+   * This is a function that takes the name of the system, and the type of the system , 
+   * and returns the subdomain name. this assumes that the system name is of the form
+   *     
+   *   system_type_subdomain_name
+   * 
+   * @param system_type 
+   * @param system_name 
+   * 
+   * @return 
+   */
+  std::string split_system_name( 
+				const std::string& system_type, 
+				const std::string& system_name
+				 ); 
+
+
+
+  
+  /** 
+   * This is to form a system name from system type and subdomain name. 
+   * again this assumes that the system name is of the form 
+   *   
+   *   system_type_subdomain_name
+   *
+   * @param system_type 
+   * @param subdomain_name 
+   * 
+   * @return 
+   */
+  std::string form_system_name(
+			       const std::string& system_type, 
+			       const std::string& subdomain_name
+			       );
+
+
+
+
+  Real get_equilibrium_temperature()
+  {
+    return _T_0;
+  };
+  Real get_equilibrium_concentration()
+  {
+    return _C_0;
+  };
+
+
+private:
+  /// Dimension of the problem (2 or 3) 
+  unsigned int  _dim;
+  /// Number of elements. 
+  unsigned int _N;
+ 
+  /// 
+  Real _l,_b,_h;
+  
+  // for the ellipse
+  Real _ae,_be,_ce; 
+
+  
+
+  /// Type of initial condit
+  std::string _initial_shape; 
+  
+
+  Number _max_error_current; 
+  
+  Number _max_error_previous; 
+
+  Number _max_error_allowed; 
+
+  
+  bool _diff_init;
+  
+  
+  /// Mesh object. 
+  Mesh*                       _mesh;
+  /// Mesh refinement object 
+  MeshRefinement*             _meshRefinement;
+ 
+  bool _error_based_refinement;
+  bool _adaptive_time_stepping;
+
+
+  /// Friend class definition for the output of the gradient of the fields. 
+  friend class GradientSystem;
+  /// Definition of the class for the gradient system.  
+  class GradientSystem; 
+  /// Pointer to the gradient systems object. 
+  GradientSystem* _gradient_system;   
+  
+
+  /// Friend class definitions for the stress solver 
+  friend class StressSolver; 
+  /// Class definition of the friend class  
+  class StressSolver; 
+  /// Pointer to the stress solver object. 
+  StressSolver* _stress_solver; 
+
+
+  /// Friend class definition to average gauss point fields to the nodes. 
+  friend class AverageToNodes; 
+  /// Class definition of class to average fields to the nodes 
+  class AverageToNodes; 
+  /// Pointer to the averaging to nodes field 
+  AverageToNodes* _average_to_nodes;
+   
+
+  /// Friend class definition for the Stress and strain system. 
+  friend class StressSystem; 
+  /// Class definition of class to hold the stress and strain
+  class StressSystem; 
+  /// Pointer to the StressSystem
+  StressSystem* _stress_system;
+
+  /// Friend class definition for any other results that you might 
+  // want to compute 
+  friend class OtherResults; 
+  /// class definition of the class to hold the other result fields
+  /// that I might want to compute . 
+  class OtherResults; 
+  /// Forward declaration for the other results, 
+  std::map<std::string,OtherResults*> _other_results_map;
+  
+
+  friend class InitialConcentration;
+  class InitialConcentration;
+  std::map<std::string,InitialConcentration*> _initial_concentrations;
+  
+  
+
+  ///  This is a collated phase field. this stores the diffusion 
+  /// terms together into a single system to simplify the construction 
+  /// of the stiffness matrices for the other fields. 
+  friend class CollatedPhaseField; 
+
+  // Class definition 
+  class CollatedPhaseField;
+
+  /// Pointer to the actual phase field. 
+  CollatedPhaseField* _collated_phase_field; 
+  
+
+  /* /// Friend class definition for the cahn hilliard solver */
+  /* friend class CahnHilliard;  */
+  /* /// Class definition for the cahn hilliard solver  */
+  /* class CahnHilliard;  */
+  /* /// Pointer to the Cahn Hilliard System */
+  /* std::map<std::string,CahnHilliard*> _cahn_hilliards;  */
+  
+  
+  
+  friend class LinearCahnHilliard; 
+  class LinearCahnHilliard; 
+  std::map<std::string,LinearCahnHilliard*> _linear_cahn_hilliards; 
+  bool contact_angle_boundary; 
+  bool extrapolated_boundary; 
+  bool interpolated_boundary;
+  
+  Number contact_angle; 
+  
+
+
+  /// Friend class definition for the electrical solver 
+  friend class Electrical; 
+  /// Class definition for the electrical solver 
+  class Electrical; 
+  ///  Pointer to the electrical solver 
+  Electrical* _electrical; 
+
+
+  /// Friend class definition for the vacancy diffusion solver 
+  friend class Diffusion; 
+  /// Class definition for the diffusion solver 
+  class Diffusion; 
+  /// Pointer to the diffusion solver
+  
+  std::map<std::string,Diffusion*> _diffusions; 
+
+  /// Friend class definition for the thermal solver 
+  friend class Thermal; 
+  /// Class diffusion for the thermal solver 
+  class Thermal; 
+  /// Pointer to the diffusion solver
+  Thermal* _thermal; 
+  
+  friend class InterfacialAverage; 
+  class InterfacialAverage; 
+  std::map<std::string,InterfacialAverage*> _interfacial_averages; 
+  
+  //// 
+  friend class ActiveRegion; 
+  class ActiveRegion; 
+  std::map<std::string,ActiveRegion*> _active_regions;
+  
+
+  std::map<std::string,std::ofstream*> _output_files;
+
+
+  std::ofstream _volt_file; 
+  
+
+  unsigned int _n_active_regions; 
+  
+  /// Friend class definition for the materials
+  friend class Material; 
+  /// Class definition for the materials
+  //class Material; 
+
+  /// Creates a dictionary of elementsets vs material names
+  std::map<subdomain_id_type,std::string>  _material_assignment; 
+
+  /// Container to hold the material names of all the materials
+  std::map<std::string,Material> _materials; 
+  
+
+  /// This is a map of the subdomains vs the  name given to them . 
+  std::map<std::string,std::set<subdomain_id_type> > _subdomains;
+
+  
+
+  
+  /// Materia name for the active set
+  std::string _active_set_material; 
+  
+ 
+
+  /// to suppress output to the terminal
+  bool _verbose;
+  
+  /// current timestep
+  Real _dt;
+ 
+  /// Initial timestep
+  Real _dt0;
+  
+  /// Small number 
+  Real _small_number;
+
+  /// notional interface thickness
+  Real _eps;
+
+  ///  Final timestep
+  Real _tf; 
+  
+  /// Initial timestep
+  Real _t0;
+
+  /// Name of the job
+  std::string jobname; 
+
+
+  /// Name of the abaqus job file
+  std::string _abq_file; 
+  
+  
+  /// Active set name
+  std::string _active_set ; 
+  
+
+  ///  Number of materials 
+  unsigned int _n_mats; 
+
+  /// Number of outputs
+  unsigned int _o_count;
+  
+
+  ///  output time 
+  Real _otime; 
+  
+
+  /// Output frequency 
+  int _ofreq;
+
+
+  /// Initital Center 
+  Point _initialCenter; 
+
+  /// Initial radius of the void. 
+  Real _radius; 
+  
+
+  Real _stabilization;
+
+  /// Norm of the initial void 
+  Real _ball_norm; 
+
+  ///  Weight for the crank nicolson scheme
+  Real _cnWeight;
+
+
+  bool _second_order_solution; 
+  bool _second_order_switch;
+  
+  unsigned int _first_order_steps; 
+
+  /// will put this into the boundary std::string _active_subdomain; 
+  AbaqusIO abq_io; 
+ 
+  /// name of the job 
+  std::string _jobname;
+
+ 
+  
+  /// Element sets vs subdomains.. 
+  
+    ///  A map between the ABAQUS set names and the libme subdomain ids. 
+    ///  I will use a map with string keys and a set with the appropriate subdomain ids. 
+  std::map<subdomain_id_type,std::string> elset_id_index; 
+  
+
+  /// This is the set of active_subdomains that are where the variables are
+  /// restricted to .  This needs to be constructed after the subdomains are 
+  /// are read into the code from the 
+  std::set<subdomain_id_type> _active_subdomains; 
+
+
+  /// A map between the abaqus boundary names and the libmesh boundary ids; 
+  std::map<std::string,boundary_id_type> sideset_id_index; 
+  
+  
+  /// A map between the libmesh boundary ids and the abaqus surfaces.. 
+  /// all the boundary conditions are to be applied on the surfaces . instead of nodesets. 
+  /// I have a feeling that this is probably a better way to do things. 
+  std::map<boundary_id_type,std::string> libmesh_abq_boundary_map; 
+
+  
+  /** 
+   * File reader function.. reads the function and goes through. 
+   * 
+   * @para file_name 
+   */
+  void read_input_file(std::string& file_name); 
+    
+  
+  /** 
+   * Constructs the set of active subdomains.. Simplifies the 
+   * checking of the active material
+   */
+  void construct_active_subdomain_set(); 
+  
+  void adaptive_time_stepper(const unsigned int& n_tstep); 
+  
+  /// Pointer to the object that writes the file.. 
+  ExodusII_IO* _ex_io;
+
+
+  /// Pointer to the mesh refinement object 
+  MeshRefinement* _mesh_refinement;
+  
+  unsigned int _n_levels_refinement; 
+
+  unsigned int _n_levels_init_refinement; 
+
+  unsigned int _n_levels_init_uniform_refinement; 
+  
+
+  Real _refine_fraction; 
+
+  Real _coarsen_fraction; 
+  
+  Real _lower_pf_limit; 
+  Real _upper_pf_limit; 
+
+  bool _anisotropy;
+
+  bool _contact_angle_boundary; 
+
+  unsigned int _n_refinement_loops;
+
+  std::string _out_file;
+
+
+  std::string _resistance_side_1;
+  std::string _resistance_side_2;
+
+
+  std::set<std::string> _output_systems;
+
+  
+
+
+  bool _output_everything; 
+
+  /** 
+   * This basically fills the _output_systems with the systems,whose results 
+   * we actually want to have in the output files.
+   */
+  void _select_output_systems(); 
+
+  /**
+     This marks all the elements that are 
+     in the phase field region for refinement upto 
+     the level of initial uniform refinement that have been 
+     specified. 
+   */
+  void _initial_uniform_refinement(); 
+
+  //Equliibrium temperature
+  Real _T_0; 
+  
+  //Equilibrium Concentration
+  Real _C_0;
+  Real _t;
+
+
+  
+  
+    
+
+
+
+};
+
+#endif // __diff_code_h__

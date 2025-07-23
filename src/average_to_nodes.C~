@@ -1,0 +1,947 @@
+
+
+/**
+ * @file   average_to_nodes.C
+ * @author Subramanya Sadasiva <ssadasiv@me-98-16.dhcp.ecn.purdue.edu>
+ * @date   Mon Mar 11 18:01:53 2013
+ * 
+ * @brief  This is the implementation of average_to_nodes.C
+ * Averages the field value to the nodes. 
+ * 
+ */
+#include "libmesh/numeric_vector.h"
+#include "libmesh/sparse_matrix.h"
+#include "libmesh/dof_map.h"
+#include "libmesh/dense_matrix.h"
+#include "libmesh/dense_vector.h"
+#include "libmesh/dense_submatrix.h"
+#include "libmesh/dense_subvector.h" 
+#include "libmesh/quadrature_gauss.h"
+#include "libmesh/mesh.h"
+#include "libmesh/fe.h"
+#include "libmesh/nonlinear_implicit_system.h"
+#include "libmesh/transient_system.h"
+#include "libmesh/parameters.h"
+#include "average_to_nodes.h"  
+#include "collated_phase_field.h"
+///Constructor for the average to nodes object. 
+
+using namespace libMesh;
+
+DiffCode::AverageToNodes::AverageToNodes(EquationSystems& eqSys,
+					   const std::string& name, 
+					   const unsigned int number):
+  LinearImplicitSystem(eqSys,name,number),
+  _diff_code(dynamic_cast<DiffCode&>(eqSys))
+{
+  add_variable("grad",FIRST,LAGRANGE); // Limit to first order. because it is the most 
+  attach_assemble_object(*this); // Attach the assembly object to this, 
+  assemble_before_solve=false;  
+  matrix_assembled= false; 
+  
+  unsigned int dim = _diff_code._dim;
+  
+  if (dim == 2) 
+    {
+      _stress_variables.resize(3); 
+      _stress_variables[0]="sigma_xx";
+      _stress_variables[1]="sigma_yy";
+      _stress_variables[2]="sigma_xy";
+      
+      _strain_variables.resize(3); 
+      _strain_variables[0]="epsilon_xx";
+      _strain_variables[1]="epsilon_yy";
+      _strain_variables[2]="epsilon_xy";
+    }
+  else
+    {
+      _stress_variables.resize(6); 
+      _stress_variables[0]="sigma_xx";
+      _stress_variables[1]="sigma_yy";
+      _stress_variables[2]="sigma_zz";
+      _stress_variables[3]="sigma_yz";
+      _stress_variables[4]="sigma_xz";
+      _stress_variables[5]="sigma_xy";
+      
+      
+      _strain_variables.resize(6); 
+      _strain_variables[0]="epsilon_xx";
+      _strain_variables[1]="epsilon_yy";
+      _strain_variables[2]="epsilon_zz";
+      _strain_variables[3]="epsilon_yz";
+      _strain_variables[4]="epsilon_xz";
+      _strain_variables[5]="epsilon_xy";
+    }
+    
+
+}
+  
+/// This is the assembly routine to assemble a single L2 matrix used for least squares fitting. 
+void DiffCode::AverageToNodes::assemble()
+{
+  matrix->zero(); 
+  //if(!matrix_assembled) 
+  // {
+      // Assembles the matrix for the L2 projection 
+  const unsigned int var =variable_number("grad");
+  const unsigned int dim = _diff_code._dim ;
+  Real small_number = _diff_code._small_number;   Real eps = _diff_code._eps; 
+  CollatedPhaseField& ch =*(_diff_code._collated_phase_field);
+  
+
+
+  const NumericVector<Number>& ch_vector = *(ch.current_local_solution); 
+  const unsigned int phi_var = ch.variable_number("phi"); 
+ 
+  const DofMap& dof_map = get_dof_map(); 
+  const DofMap& dof_map_ch = ch.get_dof_map(); 
+  
+  
+  std::vector<unsigned int> dof_indices; 
+  std::vector<unsigned int> dof_indices_ch; 
+  
+  FEType fe_grad = variable_type(var); 
+  FEType fe_ch = ch.variable_type(phi_var); 
+      
+  AutoPtr<FEBase> fe_base_grad(FEBase::build(_diff_code._dim,fe_grad)); 
+  AutoPtr<FEBase> fe_base_ch(FEBase::build(_diff_code._dim,fe_ch)); 
+  
+  QGauss q_gauss(_diff_code._dim,fe_grad.default_quadrature_order()); 
+
+  fe_base_grad->attach_quadrature_rule(&q_gauss); 
+  fe_base_ch->attach_quadrature_rule(&q_gauss); 
+
+
+  const std::vector<Real>& JxW = fe_base_grad->get_JxW(); 
+  const std::vector<std::vector<Real> >& phi = fe_base_grad->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi = fe_base_grad->get_dphi();
+  const std::vector<std::vector<Real> >& phi_ch = fe_base_ch->get_phi(); 
+  const std::vector<std::vector<RealGradient> >& dphi_ch = fe_base_ch->get_dphi(); 
+ 
+  Real diff = get_diffusive_smoothing();
+  
+
+  MeshBase::const_element_iterator el = 
+    _diff_code._mesh->active_local_elements_begin(); 
+  const MeshBase::const_element_iterator el_end = 
+    _diff_code._mesh->active_local_elements_end(); 
+
+  DenseMatrix<Number> Ke;
+
+  for(;el !=el_end;++el) 
+    {
+      const Elem* elem =*el; 
+      subdomain_id_type sub_id = elem->subdomain_id(); 
+      dof_map.dof_indices(elem,dof_indices); 
+     
+      unsigned int n_dofs_ch; 
+      if (ch.check_subdomain_inclusion(sub_id)) 
+	{
+	  dof_map_ch.dof_indices(elem,dof_indices_ch,phi_var); 
+	  n_dofs_ch = dof_indices_ch.size(); 
+	}
+      
+      
+      
+
+      Real vol = elem->volume();
+      const unsigned int n_dofs= dof_indices.size(); 
+      
+      fe_base_grad->reinit(elem);
+      fe_base_ch->reinit(elem); 
+      Ke.resize(n_dofs,n_dofs); 
+     
+
+
+
+      for (unsigned int qp=0; qp<q_gauss.n_points(); qp++) 
+	{
+	  Number phi_qp = 0.0; 
+	  Gradient grad_phi_qp(0.0,0.0,0.0);
+	  Number heaviside =1.0; 
+	  
+	  if (ch.check_subdomain_inclusion(sub_id)) 
+	    {
+	      for(unsigned int i=0; i< n_dofs_ch; i++) 
+		phi_qp += phi_ch[i][qp]*ch_vector(dof_indices_ch[i]);
+	      //heaviside = (1.0 + phi_qp)/2.0; 
+	      heaviside = 0.5*(1+weird_heaviside(phi_qp)); 
+	    }
+	  
+	  heaviside*=(heaviside<0.5)?0.0:1.0;
+	  for(unsigned int i=0; i<n_dofs; i++) 
+	    for(unsigned int j=0; j<n_dofs; j++) 
+	      Ke(i,j)+= JxW[qp]*(heaviside*phi[i][qp]*phi[j][qp]
+				 +(eps*eps*(heaviside  + vol*diff)*dphi[i][qp]*dphi[j][qp])
+				 +eps*eps*(grad_phi_qp*dphi[i][qp])*(dphi[j][qp]*grad_phi_qp));
+	}
+	  
+      dof_map.constrain_element_matrix(Ke,dof_indices,false); 
+      matrix->add_matrix(Ke,dof_indices);
+    }
+      
+  matrix->close(); 
+      ///   }
+  
+      //matrix_assembled=true; 
+}
+
+// Computes the gradient of fields and averages them to the nodes 
+void DiffCode::AverageToNodes::average_gradient_to_nodes(
+ 							 ExplicitSystem& out_system, 
+ 							 const ExplicitSystem& in_system, 
+ 							 const std::string& in_variable_name, 
+ 							 const std::string& out_variable_name)
+
+{
+   if (!matrix_assembled) 
+     assemble(); 
+   // Add a vector for the x component 
+   if (!have_vector("grad_x")) 
+     add_vector("grad_x",false); 
+   // Add a vector for the y component 
+   if(!have_vector("grad_y")) 
+     add_vector("grad_y",false); 
+   // Add a vector for the z component 
+   if(_diff_code._dim==3 && !have_vector("grad_z"))
+     add_vector("grad_z",false); 
+
+   // Put pointers to the vector above into a stl vector 
+   std::vector< NumericVector<Number>* > rhs_vectors; 
+ 
+   rhs_vectors.push_back(&get_vector("grad_x")); 
+   rhs_vectors.push_back(&get_vector("grad_y")); 
+   if (_diff_code._dim == 3) 
+     rhs_vectors.push_back(&get_vector("grad_z")); 
+
+
+   // Now get the variable for which the gradient has to be computed  
+   const unsigned int var = variable_number("grad");
+   const unsigned int in_var = in_system.variable_number(in_variable_name); 
+
+   // Get the degree of freedom map 
+   const DofMap& dof_map_in = in_system.get_dof_map();
+   const DofMap& dof_map = get_dof_map(); 
+
+   std::vector<unsigned int> dof_indices; 
+   std::vector<unsigned int> dof_indices_in; 
+
+
+   // Standard Libmesh Assembly stuff. 
+   //   FEType fe = variable_type(var); 
+   FEType fe_in   = variable_type(in_var); 
+
+   const NumericVector<Number>& in_vector = *(in_system.current_local_solution); 
+
+   AutoPtr<FEBase> fe_base_in(FEBase::build(_diff_code._dim,fe_in)); 
+   AutoPtr<FEBase> fe_base_grad(FEBase::build(_diff_code._dim,fe_in)); 
+   QGauss q_gauss(_diff_code._dim,fe_in.default_quadrature_order()); 
+
+
+   fe_base_grad->attach_quadrature_rule(&q_gauss); 
+   fe_base_in->attach_quadrature_rule(&q_gauss);  
+   
+   const std::vector<Real>& JxW = fe_base_grad->get_JxW(); 
+   const std::vector<std::vector<Real> >& phi_var = fe_base_grad->get_phi(); 
+   const std::vector<std::vector<RealGradient> >& dphi = fe_base_grad->get_dphi(); 
+   std::vector<DenseVector<Number> > Fe(_diff_code._dim); 
+   
+   MeshBase::const_element_iterator el = 
+     _diff_code._mesh->active_local_elements_begin(); 
+   const MeshBase::const_element_iterator el_end = 
+     _diff_code._mesh->active_local_elements_end(); 
+   
+   for (;el!=el_end;++el) 
+     {
+       Elem* elem = *el; 
+
+       dof_map_in.dof_indices(elem,dof_indices_in,in_var); 
+       dof_map.dof_indices(elem,dof_indices); 
+
+       fe_base_in->reinit(elem); 
+       fe_base_grad->reinit(elem); 
+
+       for (unsigned int i = 0; i< _diff_code._dim; i++) 
+	 Fe[i].resize(dof_indices.size()); 
+
+       const unsigned int n_dofs = dof_indices.size(); 
+       const unsigned int n_dofs_in  = dof_indices_in.size(); 
+
+
+       for (unsigned int qp = 0; qp <q_gauss.n_points(); qp++) 
+	 {
+	   // Compute gradient at the quadrature point 
+	   RealGradient grad_var_qp(0.0,0.0,0.0); 
+	   for (unsigned int j=0; j< n_dofs_in; j++) 
+	     grad_var_qp.add_scaled(dphi[j][qp], in_vector(dof_indices_in[j]));
+	   
+
+	   // Compute terms in the rhs appropriate for this 
+	   for (unsigned int i=0; i< _diff_code._dim; i++) 
+	     for (unsigned int j=0; j<n_dofs;j++) 
+	       Fe[i](j)+=JxW[qp]*phi_var[j][qp]*grad_var_qp(i);
+	  
+	 }
+
+
+       for (unsigned int i =0; i<_diff_code._dim; i++) 
+	 {
+	   dof_map.constrain_element_vector(Fe[i],dof_indices); 
+	   rhs_vectors[i]->add_vector(Fe[i],dof_indices); 
+	 }
+     }
+
+   const unsigned int sys_num = number(); 
+   const unsigned int out_sys_num = out_system.number(); 
+   const unsigned int out_var_num = out_system.variable_number(out_variable_name);
+   const unsigned int var_num = variable_number("grad"); 
+
+
+    for(unsigned int i=0; i<_diff_code._dim; i++) 
+      {
+        rhs_vectors[i]->close(); 
+        rhs = rhs_vectors[i]; 
+        // Solve the matrix 
+        solve_and_constrain(); 
+	  
+	// Now put the vector back into the new system 
+
+        NumericVector<Number>& out_vector = *out_system.solution; 
+ 
+        MeshBase::const_node_iterator node_it = _diff_code._mesh->local_nodes_begin();
+        const MeshBase::const_node_iterator node_it_end = _diff_code._mesh->local_nodes_end(); 
+ 
+        for(;node_it!=node_it_end; node_it++) 
+    	{
+    	  Node* node = *node_it; 
+    	 
+    	  unsigned int n_comp = node->n_comp(out_sys_num,var_num); 
+    	  if (n_comp > 0) 
+    	    {
+    	      unsigned int dof_number_out = node->dof_number(out_sys_num,out_var_num,i);
+    	      unsigned int dof_number = node->dof_number(sys_num,var,0); 
+    	      out_vector.set(dof_number_out,current_local_solution->el(dof_number));
+    	    }
+    	}
+	out_vector.close();
+	solution->zero();
+      }
+   
+}
+
+
+// This is the post processing routine that computes the stresses and strains. 
+// Ideally - (In a nonlinear solver for stress at least, the stresses should be computed at the 
+// same time as the solution is happening. not here though as it is a linear solution. 
+// whether the compute stresses and strains object can be put elsewhere needs to be thought about later.   
+void DiffCode::AverageToNodes::compute_stresses_and_strains()
+ {
+
+   const unsigned int dim = _diff_code._dim; 
+   // if (!matrix_assembled) 
+   assemble(); 
+
+   
+   std::vector<NumericVector<Number>* > stress_rhs_vectors(3);
+   std::vector<NumericVector<Number>* > strain_rhs_vectors(3); 
+   // Lets do all of them together // pressure strain energy and 
+   // von mises. if needed. 
+   std::vector<NumericVector<Number>* > invariant_rhs_vectors(3); 
+   
+   if (dim==3) 
+     {
+       stress_rhs_vectors.resize(6); 
+       strain_rhs_vectors.resize(6); 
+     }
+   
+
+   // Add the vectors to the system. 
+   
+   // Get the references to the systems that need to have pointers to
+
+
+   libMesh::out<<"computing the stresses!"<<std::endl;
+   Real small_number = _diff_code._small_number; 
+   CollatedPhaseField& ch = *(_diff_code._collated_phase_field);
+   LinearImplicitSystem& stress_solver  = 
+     _diff_code.get_system<LinearImplicitSystem>("DiffCode::stress_solver");
+  
+   StressSystem& stress_system = *(_diff_code._stress_system);
+   
+   std::vector<std::string> invariants=stress_system.get_invariants(); 
+   //Now get the vectors in the system 
+  
+   const NumericVector<Number>& ch_vector = *(ch.current_local_solution); 
+   const NumericVector<Number>& u_vector = *(stress_solver.current_local_solution); 
+   // resize that 
+   invariant_rhs_vectors.resize(invariants.size());
+   
+   
+   // Now add the vectors to this system.. 
+   // I need to check if the stress system object has all the required things there. 
+   // for example the various stress and strain components as ordered. 
+   for (unsigned int i=0; i<_strain_variables.size(); i++) 
+     {
+       if(!have_vector(_strain_variables[i]))
+	 add_vector(_strain_variables[i], 
+		    false); 
+       strain_rhs_vectors[i]=&(get_vector(_strain_variables[i])); 
+       strain_rhs_vectors[i]->zero(); 
+     }
+   
+   for (unsigned int i=0;i<_stress_variables.size(); i++) 
+     {
+       if (!have_vector(_stress_variables[i]))
+ 	add_vector(_stress_variables[i], 
+ 		   false);
+       stress_rhs_vectors[i]=&get_vector(_stress_variables[i]); 
+       stress_rhs_vectors[i]->zero(); 
+     }
+
+   for (unsigned int i=0; i<invariants.size(); i++) 
+     {
+       if (!have_vector(invariants[i]))
+	 add_vector(invariants[i]); 
+       invariant_rhs_vectors[i]=&(get_vector(invariants[i]));
+       invariant_rhs_vectors[i]->zero(); 
+     }
+   
+   
+   
+   //Get the variable numbers of the relevant variables. 
+   const unsigned int phi_var = ch.variable_number("phi"); 
+   std::vector<unsigned int> u_vars(dim); 
+   if (dim >=2)
+     {
+       u_vars[0] = stress_solver.variable_number("u"); 
+       u_vars[1] = stress_solver.variable_number("v"); 
+     }
+   if (dim ==3) 
+     {
+       u_vars[2] = stress_solver.variable_number("w"); 
+     }
+   
+   const unsigned int var = variable_number("grad"); 
+   
+   FEType fe = variable_type(var);
+   FEType fe_ch = ch.variable_type(phi_var) ; 
+   FEType fe_u  = stress_solver.variable_type(u_vars[0]);
+ 
+   AutoPtr<FEBase> fe_base (FEBase::build(dim,fe));
+   AutoPtr<FEBase> fe_base_ch (FEBase::build(dim,fe_ch)); 
+   AutoPtr<FEBase> fe_base_u (FEBase::build(dim,fe_u));  
+  
+   
+
+
+   std::vector<unsigned int> dof_indices; 
+   std::vector<unsigned int> dof_indices_ch; 
+   std::vector<std::vector<unsigned int> > dof_indices_u_comp(dim); 
+ //
+   const DofMap& dof_map = get_dof_map(); 
+   const DofMap& dof_map_u = stress_solver.get_dof_map(); 
+   const DofMap& dof_map_ch = ch.get_dof_map(); 
+
+   QGauss q_gauss(dim,fe_u.default_quadrature_order()); 
+   fe_base_u->attach_quadrature_rule(&q_gauss); 
+   fe_base->attach_quadrature_rule(&q_gauss); 
+   fe_base_ch->attach_quadrature_rule(&q_gauss); 
+   
+   //
+   const std::vector<Real>&JxW = fe_base->get_JxW(); 
+   const std::vector<std::vector<RealGradient> >& dphi_u = fe_base_u->get_dphi(); 
+   const std::vector<std::vector<Real> >& phi= fe_base->get_phi();
+   const std::vector<std::vector<Real> >& phi_ch = fe_base_ch->get_phi(); 
+ //
+ //// Allocate local space to add terms. 
+   std::vector<DenseVector<Number> > strain_vectors(_strain_variables.size());
+   std::vector<DenseVector<Number> > stress_vectors(_stress_variables.size()); 
+ //
+ // Only  pressure and energy not really interested in vm stress at the moment
+   std::vector<DenseVector<Number> > invariant_vectors(invariants.size()); 
+ 
+   DenseVector<Number> stress; 
+   DenseVector<Number> strain; 
+   DenseVector<Number> invariants_qp; 
+   if (dim==3)
+     {
+       stress.resize(6) ; 
+       strain.resize(6); 
+     }
+   else if (dim==2) 
+     {
+       stress.resize(3) ;
+       strain.resize(3) ; 
+     }
+   invariants_qp.resize(invariants.size()); 
+
+ // get the active subdomain. 
+   
+
+   
+   std::map<std::string, Material>::iterator mat_it;
+
+ 
+   
+   MeshBase::const_element_iterator el = 
+     _diff_code._mesh->active_local_elements_begin(); 
+   const MeshBase::const_element_iterator el_end = 
+     _diff_code._mesh->active_local_elements_end(); 
+   
+   for(;el!=el_end;++el) 
+     {
+       Elem* elem=*el; 
+       subdomain_id_type sub_id = elem->subdomain_id(); 
+
+       dof_map.dof_indices(elem,dof_indices); 
+       const unsigned int n_dofs =  dof_indices.size();
+       for(unsigned int i=0; i<dim; i++) 
+	 dof_map_u.dof_indices(elem,dof_indices_u_comp[i],u_vars[i]);
+       
+
+
+       const unsigned int n_dofs_u = dof_indices_u_comp[0].size(); 
+       unsigned int n_dofs_ch; 
+       
+
+       fe_base->reinit(elem); 
+       fe_base_u->reinit(elem); 
+       
+      
+
+       if (ch.check_subdomain_inclusion(sub_id)) 
+	 {
+	   dof_map_ch.dof_indices(elem,dof_indices_ch,phi_var); 
+	   n_dofs_ch = dof_indices_ch.size();
+	   fe_base_ch->reinit(elem); 
+	 }
+       // libMesh::out<<n_dofs<<std::endl;
+       
+       for (unsigned int i=0; i<strain_vectors.size();i++)
+	 {
+	 strain_vectors[i].resize(n_dofs); 
+	 // libMesh::out<<strain_vectors[i].size(); 
+	 }
+       for(unsigned int i=0; i<stress_vectors.size(); i++ )
+	 {
+	 stress_vectors[i].resize(n_dofs); 
+	 }
+       
+       for(unsigned int i=0; i<invariant_vectors.size(); i++) 
+	 {
+	 invariant_vectors[i].resize(n_dofs);
+	 }
+	 
+	 
+
+       for (unsigned int qp=0;qp<q_gauss.n_points();qp++)
+	 {
+	   //Set of vectors to compute the value of the 
+	   //displacement gradients 
+	   
+	   std::vector<RealGradient> grad_u(dim);
+	   Real phi_qp=0.0; 
+	   Real heaviside = 1.0; 
+	   /// Initialize the vectors. 
+	   for (unsigned int i=0; i<dim;i++)
+	     grad_u[i] = RealGradient(0.0,0.0,0.0); 
+	   /// Compute the gradient vectors. 
+	   for(unsigned int i=0; i < n_dofs_u; i++) 
+	     for(unsigned int j=0 ;j< dim; j++) 
+	       {
+		 grad_u[j]+=dphi_u[i][qp]*u_vector.el(dof_indices_u_comp[j][i]);
+	       }
+
+	   if (ch.check_subdomain_inclusion(sub_id)) 
+	     {
+	       for (unsigned int i=0; i< n_dofs_ch; i++) 
+		 phi_qp+=phi_ch[i][qp]*(ch_vector(dof_indices_ch[i]));
+	       // heaviside = (1.0+phi_qp)/2.0; 
+	       heaviside = 0.5*(1.0 + weird_heaviside(phi_qp));  
+	       //	 
+	       heaviside *=(heaviside<0.5)?0.0:1.0; 
+	       //   if (heaviside>1.0)
+	       //	 libMesh::out<<heaviside<<"what the bloody fuck"<<std::endl;
+	     }
+	  
+	   
+
+	   /// Add to the appropriate Strain vectors. in the Element Vectors. These need to
+	  /// be added to the appropriate strain components. 
+	   stress*=0.0;
+	   strain*=0.0;
+	   invariants_qp*=0.0; 
+	   
+	   /// xx component; 
+	   strain(0) = grad_u[0](0);
+	   /// yy component
+	   strain(1) = grad_u[1](1); 
+	   /// as can be seen this is engineering strain
+	   if (dim == 2) 
+	     strain(2) = grad_u[0](1)+grad_u[1](0); 
+	   
+	   /// if dim = 3 
+	   if (dim ==3)
+	     {
+	       /// zz component 
+	       strain(2) = grad_u[2](2); 
+	       /// yz component
+	       strain(3) =grad_u[1](2)+grad_u[2](1);
+	       /// xz component
+	       strain(4) =grad_u[0](2)+grad_u[2](0);
+	       /// yx component
+	       strain(5) =grad_u[0](1)+grad_u[1](0); 
+	       
+	     }
+	   
+	   std::string mat_name = ch.get_material_name(sub_id);
+	   
+	   
+	   mat_it = _diff_code._materials.find(mat_name); 
+	   DenseMatrix<Number> c = (mat_it->second).get_stiffness_matrix(); 
+	   
+	   c*=heaviside; 
+	   c.vector_mult(stress,strain);
+	   
+	   
+	  
+	   for (unsigned int i=0; i<invariants.size(); i++) 
+	     {
+	       if (invariants[i]==std::string("p")) 
+		 invariants_qp(i) =  stress_system.get_pressure(stress); 
+	       else if (invariants[i]==std::string("ener"))
+		 invariants_qp(i) = stress_system.get_strain_energy(stress,strain); 
+	       else if (invariants[i]==std::string("vm")) 
+		 invariants_qp(i) = stress_system.get_von_mises_stress(stress);
+	     }
+	   
+	  /// Now add everything to the vectors in element vectors. 
+	  /// these are arranged as follows. 
+	  /// in 2d 
+	  /// epsilon_xx , yy, xy , sigma_xx,yy,xy
+	  /// in 3d
+	  /// epsilon_xx,yy,zz
+	  /// epsilon_xy,xz,yz
+
+	     
+	     for(unsigned int i=0; i<n_dofs; i++) 
+	     {
+	       for (unsigned int j=0;j<strain.size();j++) 
+		 strain_vectors[j](i)+=JxW[qp]*heaviside*strain(j)*phi[i][qp];
+	       for (unsigned int j=0;j<stress.size();j++)
+		 stress_vectors[j](i)+=JxW[qp]*heaviside*stress(j)*phi[i][qp]; 
+	       for (unsigned int j=0; j<invariants_qp.size();j++) 
+		 invariant_vectors[j](i)+=JxW[qp]*heaviside*invariants_qp(j)*phi[i][qp];
+	       
+
+	     }
+	 }
+       /// Add the vectors to the rhs_vectors. 
+      
+      
+       
+       for(unsigned int i=0; i<stress.size();i++)
+	 {
+	   
+	   
+	   std::vector<unsigned int> temp_vec(dof_indices); 
+	   dof_map.constrain_element_vector(stress_vectors[i],temp_vec,false);
+	   stress_rhs_vectors[i]->add_vector(stress_vectors[i],temp_vec); 
+	   
+	 }
+       
+       for(unsigned int i=0; i<strain.size();i++) 
+	 {
+	   std::vector<unsigned int> temp_vec(dof_indices); 
+	   dof_map.constrain_element_vector(strain_vectors[i],temp_vec,false);
+	   strain_rhs_vectors[i]->add_vector(strain_vectors[i],temp_vec); 
+	 }
+       
+       for(unsigned int i=0; i<invariants_qp.size(); i++) 
+	 {
+	   std::vector<unsigned int> temp_vec(dof_indices); 
+	   dof_map.constrain_element_vector(invariant_vectors[i],temp_vec,false);
+	   invariant_rhs_vectors[i]->add_vector(invariant_vectors[i],temp_vec); 
+	 }
+       
+
+   
+     }
+   
+   
+
+   
+    const unsigned int sys_num = number(); 
+    const unsigned int out_sys_num = stress_system.number(); 
+    NumericVector<Number>& out_vector = *(stress_system.solution); 
+    const unsigned int var_num = variable_number("grad"); 
+    
+    for(unsigned int i=0;i<stress.size();i++)
+      {
+	solution->zero();
+        stress_rhs_vectors[i]->close(); 
+        rhs = stress_rhs_vectors[i]; 
+        solve_and_constrain(); 
+	 
+        unsigned int out_var_num = stress_system.variable_number(_stress_variables[i]); 
+        // Put the averaged  vectors into the nodes of the other system 
+        MeshBase::const_node_iterator node_it = _diff_code._mesh->local_nodes_begin();
+        const MeshBase::const_node_iterator node_it_end = _diff_code._mesh->local_nodes_end(); 
+     
+        for(;node_it!=node_it_end; node_it++) 
+    	 {
+    	   Node* node = *node_it; 
+    	   unsigned int n_dofs = node->n_dofs(out_sys_num,var_num);
+    	   unsigned int n_comp = node->n_comp(out_sys_num,var_num); 
+    	   if (n_comp > 0) 
+    	     {
+    	       unsigned int dof_number_out = node->dof_number(out_sys_num,out_var_num,0);
+    	       unsigned int dof_number = node->dof_number(sys_num,var,0); 
+    	       out_vector.set(dof_number_out,current_local_solution->el(dof_number));
+    	     }
+    	 }
+	solution->zero();
+      }
+   
+    for(unsigned int j=0; j<strain.size();j++) 
+      {
+	solution->zero();
+        strain_rhs_vectors[j]->close() ; 
+        rhs = strain_rhs_vectors[j]; 
+        solve_and_constrain(); 
+        // Put the averaged  vectors into the nodes of the other system 
+	 
+        unsigned int out_var_num = stress_system.variable_number(_strain_variables[j]); 
+        MeshBase::const_node_iterator node_it = _diff_code._mesh->local_nodes_begin();
+        const MeshBase::const_node_iterator node_it_end = _diff_code._mesh->local_nodes_end(); 
+     
+        for(;node_it!=node_it_end; node_it++) 
+    	 {
+    	   Node* node = *node_it; 
+    	   unsigned int n_dofs = node->n_dofs(out_sys_num,var_num);
+    	   unsigned int n_comp = node->n_comp(out_sys_num,var_num); 
+    	   if (n_comp > 0) 
+    	     {
+    	       unsigned int dof_number_out = node->dof_number(out_sys_num,out_var_num,0);
+    	       unsigned int dof_number = node->dof_number(sys_num,var,0); 
+    	       out_vector.set(dof_number_out,current_local_solution->el(dof_number));
+    	     }
+    	 }
+      }
+
+
+
+     for(unsigned int j=0; j<invariants.size();j++) 
+      {
+        solution->zero();
+	invariant_rhs_vectors[j]->close() ; 
+        rhs = invariant_rhs_vectors[j]; 
+        solve_and_constrain(); 
+	 
+        // Put the averaged  vectors into the nodes of the other system 
+     
+        unsigned int out_var_num = stress_system.variable_number(invariants[j]); 
+        MeshBase::const_node_iterator node_it = _diff_code._mesh->local_nodes_begin();
+        const MeshBase::const_node_iterator node_it_end = _diff_code._mesh->local_nodes_end(); 
+     
+        for(;node_it!=node_it_end; node_it++) 
+    	 {
+    	   Node* node = *node_it; 
+    	   unsigned int n_dofs = node->n_dofs(out_sys_num,var_num);
+    	   unsigned int n_comp = node->n_comp(out_sys_num,var_num); 
+    	   if (n_comp > 0) 
+    	     {
+    	       unsigned int dof_number_out = node->dof_number(out_sys_num,out_var_num,0);
+    	       unsigned int dof_number = node->dof_number(sys_num,var,0); 
+    	       out_vector.set(dof_number_out,current_local_solution->el(dof_number));
+    	     }
+    	 }
+      }
+
+   
+     out_vector.close(); 
+     stress_system.update();
+     
+
+ }
+
+
+
+void DiffCode::AverageToNodes::compute_interfacial_concentration()
+{
+  solution->zero();
+  rhs->zero(); 
+  const unsigned int dim= _diff_code._dim; 
+  if (!matrix_assembled) 
+    assemble(); 
+
+  Real small_number = _diff_code._small_number; 
+  
+  // Get the system for the cahn hilliard system
+  TransientLinearImplicitSystem& ch = 
+    _diff_code.get_system<TransientLinearImplicitSystem>("DiffCode::ch"); 
+  
+  const NumericVector<Number>& ch_vector =  *(ch.current_local_solution); 
+
+
+  // get the explicit system to store the variable
+  ExplicitSystem& other_res = _diff_code.get_system<ExplicitSystem>("DiffCode::other_results") ; 
+    
+  // check if the variable exists to store the variable and do the needful
+
+  
+  // I don't think I will use this
+  //  NumericVector<Number>& mu_smooth_rhs = other_res.add_vector("mu_smooth_rhs");
+  
+  const unsigned int phi_var = ch.variable_number("phi"); 
+  const unsigned int mu_var  = ch.variable_number("mu"); 
+  const unsigned int conc_sm_var = other_res.variable_number("conc_int"); 
+  
+
+  FEType fe_ch = ch.variable_type(phi_var);
+
+  FEType fe_conc = other_res.variable_type(conc_sm_var);
+
+  
+  AutoPtr<FEBase> fe_base_ch(FEBase::build(dim,fe_ch)); 
+  AutoPtr<FEBase> fe_base_conc(FEBase::build(dim,fe_conc)); 
+  
+  std::vector<unsigned int> dof_indices_ch; 
+  std::vector<unsigned int> dof_indices_mu; 
+  std::vector<unsigned int> dof_indices; 
+  
+  const DofMap& dof_map_ch = ch.get_dof_map(); 
+  const DofMap& dof_map = other_res.get_dof_map(); 
+  
+
+  QGauss q_gauss(dim,fe_ch.default_quadrature_order()); 
+  
+  fe_base_ch->attach_quadrature_rule(&q_gauss); 
+  fe_base_conc->attach_quadrature_rule(&q_gauss); 
+
+
+  const std::vector<Real>& JxW = fe_base_conc->get_JxW(); 
+  const std::vector<std::vector<Real > >& phi_ch = fe_base_ch->get_phi(); 
+  // const std::vector<std::vector<RealGradient> >& dphi_ch = fe_base_ch->get_dphi(); 
+  const std::vector<std::vector<Real > >& phi_conc = fe_base_conc->get_phi(); 
+  
+
+  DenseVector<Number> Fe; 
+  
+  subdomain_id_type active_sub_id = _diff_code._mesh->get_id_by_name(_diff_code._active_set);
+  
+  MeshBase::const_element_iterator el = _diff_code._mesh->active_local_elements_begin(); 
+  const MeshBase::const_element_iterator el_end =_diff_code._mesh->active_local_elements_end(); 
+
+
+  for(;el != el_end;++el) 
+    {
+      const Elem* elem = *el; 
+      subdomain_id_type sub_id = elem->subdomain_id();
+
+      if(sub_id == active_sub_id) 
+	{
+	  
+	  
+	  fe_base_ch->reinit(elem); 
+	  fe_base_conc->reinit(elem); 
+
+
+	  dof_map.dof_indices(elem,dof_indices); 
+	  dof_map_ch.dof_indices(elem,dof_indices_ch,phi_var);
+	  dof_map_ch.dof_indices(elem,dof_indices_mu,mu_var); 
+
+
+
+	  const unsigned int n_dofs = dof_indices.size();
+	  const unsigned int n_dofs_phi = dof_indices_ch.size(); 
+	  const unsigned int n_dofs_mu  = dof_indices_mu.size(); 
+
+	  Fe.resize(n_dofs); 
+
+	  for(unsigned int qp = 0; qp<q_gauss.n_points(); qp++) 
+	    {
+	      Number phi_qp = 0; 
+	      Number mu_qp = 0; 
+	      
+	      for (unsigned int j=0; j<n_dofs_phi;j++) 
+		{
+		  phi_qp += phi_ch[j][qp]*ch_vector(dof_indices_ch[j]); 
+		  mu_qp  += phi_ch[j][qp]*ch_vector(dof_indices_mu[j]); 
+		}
+	      Number delta = 0.0;
+	      if (std::abs(phi_qp)<0.999999)
+		delta = 1.0;
+	      
+	      for (unsigned int j =0; j<n_dofs_mu;j++) 
+		{
+		  Fe(j)+=JxW[qp]*phi_conc[j][qp]*delta*std::exp(-mu_qp/4.0); 
+		}
+	    }
+	  dof_map.constrain_element_vector(Fe,dof_indices,false); 
+	  rhs->add_vector(Fe,dof_indices); 
+	}
+    }
+  rhs->close(); 
+  solve_and_constrain(); 
+  update();
+  const unsigned int sys_num = number(); 
+  // libMesh::out<<"system number"<<sys_num<<std::endl; 
+  
+  const unsigned int out_sys_num = other_res.number();
+  //libMesh::out<<"out system number"<<out_sys_num<<std::endl;
+  //libMesh::out<< "out system name"<<other_res.name()<<std::endl; 
+
+
+  NumericVector<Number>& out_vector = *(other_res.solution); 
+  const unsigned int var_num = variable_number("grad"); 
+
+  MeshBase::const_node_iterator node_it = _diff_code._mesh->local_nodes_begin(); 
+  const MeshBase::const_node_iterator node_it_end = _diff_code._mesh->local_nodes_end(); 
+
+  for(;node_it!=node_it_end;node_it++) 
+    {
+      Node* node = *node_it; 
+      unsigned int n_dofs =node->n_dofs(out_sys_num,var_num); 
+      unsigned int n_comp =node->n_comp(out_sys_num,var_num); 
+      if (n_comp >0) 
+	{
+	  unsigned int dof_number_out = node->dof_number(out_sys_num,conc_sm_var,0); 
+	  unsigned int dof_number = node->dof_number(sys_num,var_num,0); 
+	  out_vector.set(dof_number_out,current_local_solution->el(dof_number)); 
+	  
+	}
+    }
+  out_vector.close();
+  other_res.update();
+}
+
+
+void DiffCode::AverageToNodes::solve_and_constrain() 
+{
+  solve(); 
+  get_dof_map().enforce_constraints_exactly(*this,solution.get()); 
+  update(); 
+  
+}
+
+
+void DiffCode::AverageToNodes::set_diffusive_smoothing(Real alpha) 
+{
+  _diffusive_smoothing = alpha;
+}
+
+Real DiffCode::AverageToNodes::get_diffusive_smoothing()
+{
+
+  return _diffusive_smoothing; 
+}
+
+
+Real DiffCode::AverageToNodes::weird_heaviside(Real phi) 
+{
+  return (3.0/8.0)*std::pow(phi,5.0)
+    -(5.0/4.0)*std::pow(phi,3.0)
+    +(15.0/8.0)*phi; 
+
+}

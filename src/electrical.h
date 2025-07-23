@@ -1,0 +1,157 @@
+/**
+ * @file   electrical.h
+ * @author Subramanya <subramanya@me-98-66.dhcp.ecn.purdue.edu>
+ * @date   Mon Jun 10 10:35:37 2013
+ * 
+ * @brief  Solution to the electrical solver part of the code. 
+ * 
+ * 
+ */
+
+
+
+#ifndef __electrical_h__
+#define __electrical_h__
+
+// libmesh includes 
+
+#include "libmesh/linear_implicit_system.h" 
+#include "libmesh/dirichlet_boundaries.h" 
+#include "libmesh/id_types.h"
+
+#include "diff_code.h" 
+#include "material.h"
+#include "neumann_boundary.h"
+
+
+
+using libMesh::EquationSystems;
+using libMesh::Gradient;
+using libMesh::LinearImplicitSystem;
+using libMesh::Number;
+using libMesh::NumericVector;
+using libMesh::Parameters;
+using libMesh::Point;
+using libMesh::SparseMatrix;
+using libMesh::System;
+using namespace::libMesh;
+
+
+class DiffCode::Electrical: public LinearImplicitSystem,
+  public System::Assembly
+
+{
+
+ public:
+  
+  /** 
+   * Constructor for the electrical solver
+   * 
+   * @param eqSys parent equation systems object
+   * @param name  name for the current electrical sovler
+   * @param number number for the current electrical solver 
+   * 
+   * @return an electrical object.
+   */
+  Electrical(EquationSystems& eqSys, 
+	     const std::string& name, 
+	     const unsigned int number); 
+
+
+  /** 
+   * Function assembly object
+   * 
+   */
+  void assemble(); 
+
+
+  /** 
+   * This is to set the petsc options of the linear solver. Especially as I use names for
+   * solvers and other such nicenties
+   */
+  void reinit_lin_solver(); 
+
+
+  /** 
+   * Adds a dirichlet boundary conditionf for the electrical solution part of the solver. 
+   * 
+   * @param i  The id of the boundary where the boundary condition is to be applied
+   * @param value  The value of the boundary condition to be applied
+   */
+  void add_dirichlet_boundary_condition(boundary_id_type& i, 
+					 Real value); 
+
+
+  /** 
+   * Adds the neumann boundary condition for the electrical solution part of the solver.
+   * 
+   * @param i the id fo the boundary where the boundary condition is to be appleid
+   * @param value  the value of the boundary condition to be applied.
+   */
+  void add_neumann_boundary_condition(boundary_id_type& i, 
+				      RealGradient vector_value,
+				      Real value
+				      ); 
+
+
+  void solve_and_constrain();
+
+  
+  /// Basically this will compute the resistance by 
+  /// computing the flux at s1, 
+  /// and the voltage difference between s1 and s2
+  
+  void compute_resistance( Number& current, 
+			   Number& voltage,
+			   Number& resistance,
+			   const std::string& side1,
+			   const std::string& side2
+			   ); 
+  
+
+
+  std::string _active_set;
+
+ private:
+  
+
+/// Vector containing the dirichlet boundary conditions for
+  /// the solver 
+
+
+  // std::vector<DirichletBoundary*>  _dbc_phi;
+
+  /// Vector containing the neumann boundary conditions for the solver 
+  /// std::vector<NeumannBoundary*> _neumann_bc_phi; 
+
+  /// boolean to check if the system is constrained or not. 
+  bool _constrained; 
+  
+  /// Map of dirichlet boundary conditions 
+  std::map<boundary_id_type,DirichletBoundary> _electrical_dirichlet_bcs;
+
+
+  /// Map of Neumann boundary conditions 
+  std::map<boundary_id_type,NeumannBoundary> _electrical_neumann_bcs; 
+  
+  
+
+  /// Dirichlet boundary sides,
+  std::set<boundary_id_type> _dirichlet_boundary_sides; 
+
+  /// Neumann boundary sides, 
+  std::set<boundary_id_type> _neumann_boundary_sides; 
+
+
+  /// Reference to the parent diffcode object  
+  DiffCode&  _diff_code; 
+
+
+  
+  
+}; 
+
+#endif //__electrical_h__
+
+
+

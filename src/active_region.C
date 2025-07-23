@@ -1,0 +1,287 @@
+/**
+ * @file   active_region.C
+ * @author Subramanya <ssadasiv@me-98-2.dhcp.ecn.purdue.edu>
+ * @date   Fri Oct 11 11:55:56 2013
+ * 
+ * @brief  Implementation of active_region.h. Trying to get the 
+ * 
+ * 
+ */
+
+#include "active_region.h"
+#include <sstream>
+
+using namespace libMesh;
+DiffCode::ActiveRegion::ActiveRegion(
+			   const std::string& name, 
+			   const unsigned int number,
+			   DiffCode& diffcode
+				     ):
+  _diff_code(diffcode)
+{
+  _name = name; 
+  _number = number;  
+}
+
+std::set<subdomain_id_type>* DiffCode::ActiveRegion::get_subdomains()
+{
+  return &_subdomain_ids;
+}
+
+
+bool DiffCode::ActiveRegion::subdomain_id_inclusion(subdomain_id_type sub_id)
+{
+  return (_subdomain_ids.find(sub_id) != _subdomain_ids.end()); 
+}
+
+void DiffCode::ActiveRegion::add_subdomain_ids() 
+{
+  _subdomain_ids =_diff_code._subdomains.find(_name)->second;
+  
+}
+
+bool DiffCode::ActiveRegion::is_phase_field_region()
+{
+  return _phase_field_region;
+}
+
+std::string DiffCode::ActiveRegion::get_name()
+{
+  return _name; 
+}
+
+unsigned int DiffCode::ActiveRegion::get_number()
+{
+  return _number; 
+}
+
+
+std::string DiffCode::ActiveRegion::get_material_name() 
+{
+  return _material; 
+}
+
+Number DiffCode::ActiveRegion::get_phase_field_value(const Point& p) 
+{
+  // for (unsigned int i=0; i< _n_voids; i++) 
+  //   {
+  //     if (_dim == 2) 
+  // 	_function_values[i]=_get_phase_field_value_2D(p,i) ; 
+  //     else 
+  // 	_function_values[i]=_get_phase_field_value_3D(p,i) ; 
+
+  //   }
+  // return *std::min_element(_function_values.begin(),_function_values.end()); 
+  Point o= _sin_origin; 
+  Real theta= _line_angle; 
+  Real omega = _sin_freq;
+  Real A = _sin_amp; 
+  return _get_sinusoidal_field_value(p, 
+				     o,
+				     theta,
+				     omega, 
+				     A); 
+}
+
+
+
+
+Number DiffCode::ActiveRegion::_get_phase_field_value_2D(const Point& p,unsigned int void_number) 
+{
+  
+
+  Point shifted_point = p-_voids[void_number].center ; 
+  Point rotated_point = _voids[void_number].rotation_matrix*shifted_point;
+  
+  Real x = rotated_point(0); 
+  Real y = rotated_point(1); 
+  Real a = _voids[void_number].sizes(0); 
+  Real b = _voids[void_number].sizes(1); 
+
+  Real eps = _diff_code._eps; 
+  Real t =std::sqrt(2.0)*eps;
+  Real r = std::sqrt(x*x+y*y); 
+  Real phi = 0.0; 
+  
+  
+ 
+  if (r < 1e-10) 
+    {
+      // libMesh::out<<"value -1.0"<<std::endl;
+      phi= -1.0; 
+    }
+  else
+    {
+      Real theta=  std::atan2(y,x); 
+      Real re = a*b/std::sqrt(
+			 b*b*std::pow(std::cos(theta),2)
+			 +a*a*std::pow(std::sin(theta),2)
+			 );
+      
+      phi= std::tanh((r-re)/t);
+    }
+  
+
+  
+  return phi; 
+}
+
+Number DiffCode::ActiveRegion::_get_phase_field_value_3D(const Point& p,unsigned int void_number) 
+{
+  Point shifted_point = _voids[void_number].center - p; 
+  
+  Point rotated_point = _voids[void_number].rotation_matrix*shifted_point;
+  
+  Real x = rotated_point(0); 
+  Real y = rotated_point(1); 
+  Real z = rotated_point(2); 
+
+  Real a = _voids[void_number].sizes(0); 
+  Real b = _voids[void_number].sizes(1); 
+  Real c = _voids[void_number].sizes(2); 
+  
+  Real eps = _diff_code._eps; 
+  Real t =std::sqrt(2.0)*eps;
+  Real r = std::sqrt(x*x+y*y+z*z); 
+  Real phi = 0.0; 
+  Real theta= 0.0; 
+  
+  if (r < 1e-10) 
+    return -1.0; 
+  else
+    {
+      phi = std::acos(z/r) ;
+      theta = std::atan2(y,x) ;
+
+      Real re = a*b*c/std::sqrt(
+			   b*b*c*c*std::pow( std::cos(theta)*std::sin(phi),2) 
+			   + a*a*c*c*std::pow(std::sin(theta)*std::sin(phi),2)
+			   + a*a*b*b*std::pow(std::cos(phi),2)
+				);
+      return std::tanh((r-re)/t);
+      // if (r < re-t)
+      // 	return -1.0 ;
+      // else if (r > re+t) 
+      // 	return 1.0 ; 
+      // else 
+      // 	return std::sin((r - re)/eps); 
+    }
+  return 0.0; 
+}
+
+
+void DiffCode::ActiveRegion::read_active_region_info(GetPot& inputfile)
+{
+  _dim = _diff_code._dim;
+  // read the material assignment 
+  _material = inputfile(_form_keys(std::string("material")),std::string("copper"));
+  libMesh::out<<_material<<std::endl;
+  // read the number of voids 
+  _phase_field_region = inputfile(_form_keys(std::string("phase_field_region")),
+				  false);
+  std::string element_set_name = inputfile(_form_keys(std::string("element_set")),
+					   std::string("all"));
+ 
+  add_subdomain_ids();
+  unsigned int n_surfs = inputfile(_form_keys(std::string("n_surfs")),0);
+  for (unsigned int i=0; i < n_surfs;i++) 
+    {
+      _boundary_ids.insert(inputfile(_form_keys(std::string("surfaces")),std::string("surf"),i));
+    }
+  
+  if (_phase_field_region)
+    {
+      Real so1 = inputfile(_form_keys(std::string("sin_origin")),0.2,0); 
+      Real so2 = inputfile(_form_keys(std::string("sin_origin")),0.1,1); 
+      libMesh::out<<"so1 "<<so1<<"so2 "<<so2<<"\n";
+      _sin_origin(0) = so1 ;
+      _sin_origin(1) = so2 ;
+      _line_angle = inputfile(_form_keys(std::string("line_angle")),0.0); 
+      _sin_amp = inputfile(_form_keys(std::string("sin_amp")),0.1);
+      _sin_freq = inputfile(_form_keys(std::string("sin_freq")),4); 
+    }
+}
+
+std::string DiffCode::ActiveRegion::_form_keys(const std::string feature) 
+{
+  std::stringstream ss; 
+  std::string ar = std::string("regions"); 
+  ss<<ar<<"/"<<_name<<"/"<<feature; 
+  return ss.str(); 
+}
+
+std::string DiffCode::ActiveRegion::_form_keys_for_voids(const unsigned int void_number, 
+					       const std::string feature) 
+{
+  std::stringstream ss; 
+  std::string ar = std::string("regions"); 
+  ss<<ar<<"/"<<_name<<"/"<<"void_"<<void_number<<"/"<<feature;
+  return ss.str(); 
+}
+
+
+TensorValue<Number> DiffCode::ActiveRegion::_rotation_matrix_2D(const Number alpha) 
+{
+  TensorValue<Number> dm; 
+  dm.zero();
+  dm(0,0) = std::cos(alpha); 
+  dm(0,1) = std::sin(alpha); 
+  dm(1,0) = -std::sin(alpha); 
+  dm(1,1) = std::cos(alpha); 
+  dm(2,2) = 1.0;
+  return dm; 
+}
+
+
+TensorValue<Number> DiffCode::ActiveRegion::_rotation_matrix_3D(const Number alpha, 
+					      const Number beta, 
+					      const Number gamma)
+{
+  TensorValue<Number> dm_alpha,dm_beta,dm_gamma,dm; 
+  
+  dm.zero(); 
+  
+  dm_alpha.zero(); 
+  dm_alpha(1,1) = std::cos(alpha); 
+  dm_alpha(1,2) = std::sin(alpha); 
+  dm_alpha(2,1) = -std::sin(alpha); 
+  dm_alpha(2,2) = std::cos(alpha); 
+  dm_alpha(0,0) = 1.0; 
+
+  dm_beta.zero(); 
+  dm_beta(0,0) = std::cos(beta); 
+  dm_beta(0,2) = std::sin(beta); 
+  dm_beta(2,0) = -std::sin(beta); 
+  dm_beta(2,2) = std::cos(beta); 
+  dm_beta(1,1) = 1.0; 
+  
+  dm_gamma.zero();
+  dm_gamma(0,0) = std::cos(gamma); 
+  dm_gamma(0,1) = std::sin(gamma); 
+  dm_gamma(1,0) = -std::sin(gamma); 
+  dm_gamma(1,1) = std::cos(gamma); 
+  dm_gamma(2,2) = 1.0; 
+  
+  dm = dm_gamma*(dm_beta*dm_alpha);
+
+  return dm;
+}
+
+
+Real DiffCode::ActiveRegion::_get_sinusoidal_field_value(const Point& p,
+				 const Point& o,
+				 const Real& theta,
+       				 const Real& omega,
+				 const Real& A)
+{
+ 
+  Point shifted_point = p - o;
+  //Real r = shifted_point.size(); 
+  Point rotated_point = _rotation_matrix_2D(-theta)*shifted_point; 
+  Real x = rotated_point(0); 
+  Real y = rotated_point(1); 
+  Real f = A*std::sin(omega*x)+y;
+  Real eps = _diff_code._eps; 
+  //Real eps= std::sqrt(2)*_diff_code._eps; 
+  return std::tanh(f/eps); 
+}

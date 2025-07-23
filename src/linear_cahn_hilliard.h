@@ -1,0 +1,140 @@
+#ifndef __linear_cahn_hilliard_h__
+#define __linear_cahn_hilliard_h__
+
+// LibMesh includes
+#include "libmesh/transient_system.h"
+//#include "libmesh/nonlinear_solver.h"
+//#include "libmesh/petsc_dm_nonlinear_solver.h"
+
+// Example includes
+#include "diff_code.h"
+#include "active_region.h"
+#include "ch_neumann_boundary.h"
+//#include "neumann_boundary.h"
+/**
+ * Cahn_Hilliard's friend class definition
+ */
+
+using namespace::libMesh;
+
+class DiffCode::LinearCahnHilliard : public TransientImplicitSystem,
+  public System::Initialization,
+  public System::Assembly
+  
+{
+public:
+  /**
+     Petsc DM nonlinear solver
+   */
+
+
+  /**
+   * Constructor.
+   */
+  LinearCahnHilliard(EquationSystems& eqSys, const std::string& name, const unsigned int number);
+
+  void initialize();
+  
+
+  void assemble(); 
+
+
+  void reinit_lin_solver(); 
+  
+  /**
+     Set whether a solve has been done or not 
+     @param solved whether the intial solution is done. 
+   */
+  void set_init_solve(bool solved); 
+  
+  /**
+     degenerate solver.. to solve or not. 
+     @param beta This is a parameter used to manage the degeneracy of the mobility
+   */
+  void set_beta_w(Real beta); 
+
+  /** 
+      Get the initial solve
+  */
+  bool get_init_solve(); 
+
+
+  /** 
+   * Smooth the chemical potential after solution, 
+   * This is to get rid of the spikes that show up outside the interfacial 
+   * region. 
+   */
+  void smooth_chemical_potential();
+
+
+
+  void initial_mesh_refinement();
+
+
+  void shift_to_second_order(); 
+
+  void add_contact_boundary_condition(const boundary_id_type& i, 
+				      const Number& contact_angle, 
+				      const Number& surface_energy);
+
+  
+
+  void set_implicit_contact_boundary(bool tf); 
+
+  void set_interpolated_contact_boundary(bool tf); 
+  
+  void get_center_of_mass_and_volume(Point& com,
+				     Number& volume);
+  
+
+private:
+  /// Solder bubble is the parent object that this belongs to.
+  DiffCode& _diff_code;
+
+  std::map<boundary_id_type,CHNeumannBoundary> _contact_boundary_conditions;
+  std::set<boundary_id_type> _contact_boundary_sides; 
+
+
+  bool _init_solve;
+  Real _beta_w;
+  Real _cnicol;
+  
+  Real _stabilization; 
+
+  bool _second_order; 
+  bool _interpolated; 
+  bool _implicit_contact_boundary;
+  /// The node where the chemical potential is 
+  /// set to zero. 
+  unsigned int _mu_node; 
+  
+  /// This is to check if the mu is constrained. 
+  bool _mu_constrained;
+  /// The penalty value that is used for the 
+  /// application of boundary conditions 
+  //const Real _penalty = 1.0e10;
+  //const Real _mu_fixed = 0.0; 
+  ActiveRegion* _active_region;
+
+  inline Real _get_psi_conc(const Real& phi); 
+  inline Real _get_psi_conv(const Real& phi); 
+  inline Real _get_psi_conc_deriv(const Real& phi); 
+  inline Real _get_psi_conv_deriv(const Real& phi); 
+  inline Real _get_psi_conc_2_deriv(const Real& phi); 
+  inline Real _get_psi_conv_2_deriv(const Real& phi); 
+  inline Real _get_extrapolated_mobility(const Real& phi, 
+					 const Real& phi_old); 
+
+  
+  inline Real _get_sec_order_psi_deriv_rhs(const Real& phi); 
+  inline Real _get_sec_order_psi_deriv_lhs(const Real& phi); 
+  inline Real _delta_4_degree(const Real& phi); 
+
+  //  NeumannBoundary
+
+
+
+};
+
+
+#endif // __linear_cahn_hilliard_h__

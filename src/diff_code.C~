@@ -1,0 +1,1076 @@
+/**
+ * @file   diff_code.C
+ * @author Subramanya <subramanya@me-98-66.dhcp.ecn.purdue.edu>
+ * @date   Wed Jun  5 13:20:52 2013
+ * 
+ * @brief  Implementation for diff_code.h 
+ * 
+ * 
+ */
+#include <iomanip>
+
+#include "libmesh/mesh_generation.h" 
+#include "libmesh/mesh_modification.h"
+#include "libmesh/numeric_vector.h" 
+
+
+#include "libmesh/getpot.h"
+
+//#include "abaqus_io.h" 
+#include "diff_code.h"
+#include "material.h"
+
+#include "stress_solver.h"
+#include  <sstream>
+#include "electrical.h"
+#include "stress_system.h"
+#include "gradient_system.h"
+#include "average_to_nodes.h"
+#include "interfacial_average.h"
+#include "other_results.h"
+#include "thermal.h"
+
+#include "diffusion.h"
+#include "collated_phase_field.h"
+#include "linear_cahn_hilliard.h"
+#include "initial_concentration.h"
+
+void DiffCode::Create(DiffCode** c,const Parallel::Communicator& comm_in) 
+ {
+   Mesh* mesh = new Mesh(comm_in); 
+   DiffCode *diffcode = new DiffCode(mesh); 
+   *c = diffcode; 
+ }
+
+ void DiffCode::Destroy(DiffCode** c) 
+ {
+   DiffCode* diffcode = *c; 
+   Mesh*  mesh = diffcode->_mesh; 
+   delete diffcode; 
+   delete mesh;
+   *c = NULL; 
+ }
+
+
+ void DiffCode::init() 
+ { _dt = 0; 
+   _o_count = 0; 
+   _mesh_refinement->uniformly_refine(_n_levels_init_uniform_refinement);
+   libMesh::out<<"Getting here1 "<<std::endl;
+   _mesh->prepare_for_use();
+   this->EquationSystems::init(); 
+   
+   std::map<std::string,LinearCahnHilliard*>::iterator ch_it = _linear_cahn_hilliards.begin(); 
+   const std::map<std::string,LinearCahnHilliard*>::iterator ch_it_end = _linear_cahn_hilliards.end(); 
+   
+   libMesh::out<<"Getting here"<<std::endl;
+
+   _collated_phase_field->collate_phase_field_values();
+   for (unsigned int i = 0; i< _n_levels_init_refinement;i++)
+     {
+       _collated_phase_field->refine_mesh_based_on_values();
+       _mesh_refinement->refine_and_coarsen_elements();
+       _mesh->print_info();
+       // _mesh->boundary_info->print_info();
+       this->EquationSystems::reinit(); 
+       for (;ch_it !=ch_it_end; ch_it++)
+   	 {
+   	   ch_it->second->initialize();
+   	 }
+       _collated_phase_field->collate_phase_field_values();
+     }
+ }
+
+
+void DiffCode::step(const Real& dt) 
+{
+  if (dt<0) 
+    _dt= _dt0; 
+  else
+    _dt = dt; 
+ 
+
+
+  
+  std::map<std::string,LinearCahnHilliard*>::iterator ch_it = _linear_cahn_hilliards.begin(); 
+  const std::map<std::string,LinearCahnHilliard*>::iterator ch_it_end = _linear_cahn_hilliards.end(); 
+
+  std::map<std::string,Diffusion*>::iterator diff_it = _diffusions.begin(); 
+  const std::map<std::string,Diffusion*>::iterator diff_it_end = _diffusions.end(); 
+  
+  std::map<std::string,InterfacialAverage*>::iterator iav_it = _interfacial_averages.begin(); 
+  const std::map<std::string,InterfacialAverage*>::iterator iav_it_end = _interfacial_averages.end(); 
+
+  std::map<std::string,OtherResults*>::iterator ores_it = _other_results_map.begin(); 
+  const std::map<std::string,OtherResults*>::iterator ores_it_end = _other_results_map.end(); 
+
+  std::map<std::string,InitialConcentration*>::iterator init_it = _initial_concentrations.begin(); 
+  const std::map<std::string,InitialConcentration*>::iterator init_it_end = _initial_concentrations.end(); 
+  
+
+ 
+  _collated_phase_field->collate_phase_field_values();
+ 
+  
+  for (ch_it=_linear_cahn_hilliards.begin()
+	 ;ch_it!=ch_it_end;ch_it++) 
+    {
+      *(ch_it->second->older_local_solution) 
+	=*(ch_it->second->old_local_solution); 
+
+      *(ch_it->second->old_local_solution) =
+	*(ch_it->second->current_local_solution); 
+     
+      if (_second_order_switch) 
+	{
+	  ch_it->second->shift_to_second_order(); 
+
+	}
+      
+    }
+  
+  
+  for (;diff_it!=diff_it_end;diff_it++) 
+    {
+      *(diff_it->second->old_local_solution) =
+	*(diff_it->second->current_local_solution); 
+    }
+  
+   *(_thermal->old_local_solution) =
+     *(_thermal->current_local_solution);
+  
+  libMesh::out<<"Solving the electrical problem"<<std::endl; 
+  libMesh::out<<"the problem is here"<<std::endl;
+  _electrical->reinit_lin_solver(); 
+  _electrical->solve_and_constrain();
+ 
+ 
+
+
+
+
+  libMesh::out<<"Solving the thermal problem" <<std::endl; 
+  _thermal->reinit_lin_solver(); 
+  _thermal->solve_and_constrain();
+  
+   libMesh::out<<"Solving the stress  problem"<<std::endl; 
+   _stress_solver->reinit_lin_solver(); 
+   _stress_solver->solve_and_constrain(); 
+   _stress_system->compute_stresses_and_strains();
+  libMesh::out<<"Solving the ch  problem"<<std::endl; 
+  std::stringstream line_stream;
+  for (ch_it=_linear_cahn_hilliards.begin();ch_it!=ch_it_end; ch_it++) 
+    {
+      ch_it->second->reinit_lin_solver(); 
+      ch_it->second->solve();
+      ch_it->second->set_init_solve(false);
+    }
+  libMesh::out<<"diff_init"<<_diff_init<<std::endl;
+  if (_diff_init)
+    {
+      libMesh::out<<"aw"<<std::endl;
+      for(init_it =_initial_concentrations.begin();
+	  init_it !=init_it_end;
+	  init_it++)
+	{
+	  init_it->second->solve();
+	}
+    }
+  _diff_init=false;
+   // for ( iav_it = _interfacial_averages.begin(); 
+   // 	iav_it!= _interfacial_averages.end(); 
+   // 	iav_it++) 
+   //   {
+   //     iav_it->second->smooth_ch_chemical_potential(); 
+   //   }
+  libMesh::out<<"collating phase field values"<<std::endl;
+ 
+ 
+ 
+
+  for (diff_it=_diffusions.begin()
+  	 ;diff_it!=diff_it_end
+  	 ;diff_it++)
+    {
+      diff_it->second->reinit_lin_solver(); 
+      libMesh::out<<"solving the diffusion problem"<<std::endl;
+      diff_it->second->solve(); 
+    }
+ 
+  _collated_phase_field->collate_phase_field_values();
+ 
+  if (_error_based_refinement) 
+    _collated_phase_field->refine_mesh_based_on_error(); 
+  else
+    _collated_phase_field->refine_mesh_based_on_values();
+  
+  _mesh_refinement->refine_and_coarsen_elements();
+  this->EquationSystems::reinit(); 
+  
+  
+
+}
+
+
+ void DiffCode::read_input_file(std::string& file_name) 
+ {
+
+   std::stringstream sss; 
+   libMesh::out<<"Reading the input file"<<std::endl;
+///  Create the getpot input file 
+   libMesh::out<<file_name<<std::endl;
+   GetPot inputfile(file_name); 
+   _abq_file = inputfile ("abqfile",std::string("abq_file.inp")); 
+   _dim      = inputfile("dim",2); 
+   abq_io.read(_abq_file);  // Reading the abaqus file first so that the mesh info is all nice and juicy. 
+  
+   _subdomains = abq_io.get_element_set_subdomain_ids();
+   
+   libMesh::out<<"Read the file" <<_abq_file<<std::endl;
+
+ ///  Read the main constants   
+   _cnWeight = inputfile("cnweight",0.5);
+   _n_active_regions = inputfile("n_regions",1); 
+
+   
+   //_out_files.resize(_n_active_regions);
+
+   for (unsigned int i=0; i < _n_active_regions; i++) 
+     {
+       std::stringstream ss; 
+       ss<<"region";
+       ss<<"_"<<i+1;
+       std::string active_region_key =ss.str(); 
+       std::string active_region_name = inputfile(active_region_key,std::string("active_region")); 
+       _active_regions.insert(
+			      std::make_pair(
+					     active_region_name, 
+					     new ActiveRegion(active_region_name, 
+											  i , 
+											  *this)
+									 )
+			      ); 
+
+       _active_regions.find(active_region_name)->second->read_active_region_info(inputfile); 
+       
+     }
+  
+   _stress_solver = &(add_system<DiffCode::StressSolver>(std::string("DiffCode::stress_solver")));
+   _electrical= &(add_system<DiffCode::Electrical>(std::string("DiffCode::elec"))); 
+  
+   _volt_file.open(std::string("electrical.txt").c_str());
+   _volt_file<<std::fixed;
+   _volt_file<<std::setprecision(6);
+   _volt_file<<"time \t current \t delta_v \t resistance"<<std::endl;
+  
+
+
+
+   _stress_system = &(add_system<DiffCode::StressSystem>(std::string("DiffCode::stress_system"))); 
+   _gradient_system = &(add_system<DiffCode::GradientSystem>(std::string("DiffCode::gradient_system"))); 
+   
+   _thermal = & (add_system<DiffCode::Thermal>(std::string("DiffCode::thermal")));
+   
+   _average_to_nodes = &(add_system<DiffCode::AverageToNodes>(std::string("DiffCode::average_to_nodes")));
+   
+   _collated_phase_field = &(add_system<DiffCode::CollatedPhaseField>(std::string("DiffCode::collated_phase_field"))); 
+
+
+   std::map<std::string,ActiveRegion*>::iterator ar_it = _active_regions.begin();
+   const std::map<std::string,ActiveRegion*>::iterator ar_it_end = _active_regions.end(); 
+   
+
+   for(; ar_it!=ar_it_end;ar_it++) 
+     {
+       if (ar_it->second->is_phase_field_region()) 
+	 {
+	   std::string diff_sys_name = form_system_name(std::string("DiffCode::diffusion"),
+							ar_it->first); 
+	   _diffusions.insert(
+			      std::make_pair( ar_it->first,
+					      &(add_system<DiffCode::Diffusion>(diff_sys_name))
+					      )
+			      ); 
+	   std::string ch_sys_name = form_system_name(std::string("DiffCode::linear_cahn_hilliard"), 
+						      ar_it->first); 
+	   
+	   _linear_cahn_hilliards.insert(
+				  std::make_pair(ar_it->first,
+						 &(add_system<DiffCode::LinearCahnHilliard>(ch_sys_name))
+						 )
+					 );
+
+
+	   std::string init_conc_name = form_system_name(std::string("DiffCode::init_conc"), 
+						      ar_it->first); 
+	   
+	   _initial_concentrations.insert(
+					  std::make_pair(ar_it->first,
+							 &(add_system<DiffCode::InitialConcentration>(init_conc_name))
+							 )
+					  );
+	   
+	   
+	   std::string ch_file_name = ar_it->first+".txt";
+	   
+	   std::ofstream* new_ofst = new std::ofstream(); 
+	   
+	   new_ofst->open(ch_file_name.c_str()); 
+	   std::stringstream file_line; 
+	   file_line<<"time \t   x \t  y \t  z  \t volume \n"<<std::endl;
+	  
+	   libMesh::out<<file_line.str()<<std::endl;
+	   
+	   // new_ofst-><<std::fixed;
+	   //new_ofst-><<std::setprecision(6);
+	   
+	   new_ofst->write(file_line.str().c_str(),
+			   file_line.str().length());
+	   
+	   //  new_ofst->close();
+	   _output_files.insert(
+			       std::make_pair(ar_it->first,
+					      new_ofst)
+			       );
+	   
+	   new_ofst->flush();
+
+
+	   std::string iav_name = form_system_name(std::string("DiffCode::interfacial_average"), 
+						   ar_it->first); 
+	   _interfacial_averages.insert(
+					std::make_pair(ar_it->first,
+						       &(add_system<DiffCode::InterfacialAverage>(iav_name))
+						       )
+					); 
+	   std::string ores_name =form_system_name(std::string("DiffCode::other_results"), 
+						   ar_it->first); 
+	   _other_results_map.insert(
+				     std::make_pair(ar_it->first,
+						    &(add_system<DiffCode::OtherResults>(ores_name))
+						    )
+				     );
+	 }
+     }
+   
+   
+   
+   _dt = inputfile("dt",1e-4);
+   _dt0 = inputfile("dt0",1e-4); 
+   _eps = inputfile("epsilon",0.01); 
+   //_initialCenter(0.0,0.0,0.0);
+   
+   _small_number = inputfile("small_number",1e-6);
+   _tf = inputfile("tf",1.0); 
+   _t0 = inputfile("t0",0.0); 
+   _verbose = inputfile("verbose",false); 
+   _ofreq = inputfile("ofreq",10); 
+   _otime = inputfile("otime",1e-3);
+   _output_everything = inputfile("output_everything",false);
+   _select_output_systems(); 
+
+   _jobname = inputfile("jobname",std::string("job_")); 
+   _anisotropy = inputfile("anisotropy",false);
+   _T_0 = inputfile("Teq",.5);
+   _C_0 = inputfile("Ceq",1.0);
+   sss.str(std::string()); 
+   sss<<_jobname;
+   // sss<<".e"; 
+   _out_file=sss.str();
+
+   ///  Read the material properties and set it into the material vector
+  
+   _n_levels_refinement = inputfile("refinement_levels",2);
+   _refine_fraction = inputfile("refine_fraction",0.1); 
+   _coarsen_fraction = inputfile("coarsen_fraction",0.9); 
+   _n_levels_init_refinement = inputfile("init_refinement",2);
+   _n_levels_init_uniform_refinement = inputfile("init_uniform_refinement",2);
+   _n_refinement_loops  = inputfile("refinement_loops",2); 
+   _lower_pf_limit = inputfile("lower_pf",-0.95); 
+   _upper_pf_limit = inputfile("upper_pf",0.95); 
+
+   _resistance_side_1 = inputfile("resistance_side1",std::string("left"));
+   _resistance_side_2 = inputfile("resistance_side2",std::string("right"));
+   
+   _error_based_refinement = inputfile("error_based_refinement",false);
+   _adaptive_time_stepping = inputfile("adaptive_time_stepping",false); 
+   _mesh_refinement->refine_fraction() = _refine_fraction; 
+   _mesh_refinement->coarsen_fraction() = _coarsen_fraction; 
+   _mesh_refinement->max_h_level() = _n_levels_refinement; 
+  
+
+   _second_order_solution = inputfile("second_order",true); 
+   _first_order_steps = inputfile("first_order_steps",4); 
+   _stabilization  = inputfile("stabilization_param",1.0);  
+   _contact_angle_boundary = inputfile("contact_angle",false); 
+   _n_mats = inputfile("materials/n_mats",1);   
+   
+  
+   
+   /// Read the 
+
+   
+   for (unsigned int i = 0;i<_n_mats;i++) 
+     {
+       sss.str(std::string());
+       sss<<"materials/name_";
+       sss<<i+1;
+       libMesh::out<<"reading materials "<<""<<std::endl;
+       
+       std::string mat_name = inputfile(sss.str()," "); 
+      
+       Material* new_mat = new Material(mat_name,i); 
+      
+       
+       std::string base_name = std::string("materials/")+mat_name;     
+       std::string e_key = base_name+std::string("/E");
+       std::string nu_key = base_name+std::string("/nu"); 
+       std::string d_key = base_name+std::string("/d"); 
+       std::string k_key = base_name+std::string("/k"); 
+       std::string gamma_key = base_name+std::string("/gamma"); 
+       std::string c_key = base_name+std::string("/c"); 
+       std::string alpha_key = base_name+std::string("/alpha"); 
+       std::string omega_key = base_name+std::string("/omega"); 
+       std::string z_key    = base_name+std::string("/Z"); 
+       std::string ds_key   = base_name+std::string("/sd"); 
+       std::string zs_key   = base_name+std::string("/sZ"); 
+       std::string es_key   = base_name+std::string("/sE");
+       std::string rs_key   = base_name+std::string("/sR"); 
+       std::string td_key = base_name+std::string("/dT"); 
+       std::string tm_key = base_name+std::string("/rhocp");
+       std::string hf_key = base_name+std::string("/hf");
+       std::string q_key = base_name+std::string("/Q");
+       std::string qs_key = base_name+std::string("/sQ");
+       
+       //std::string gamma_key = base_name+std::string("/sgamma");
+       
+       
+       new_mat->set_elasticity_parameters(inputfile(e_key,1.0),
+ 					 inputfile(nu_key,0.3),
+ 					 _dim,
+ 					 false); 
+    
+       new_mat->set_diffusivity(inputfile(d_key,1.0)); 
+       new_mat->set_atomic_volume(inputfile(omega_key,1.0)); 
+       new_mat->set_thermal_conductivity(inputfile(k_key,1.0));
+       new_mat->set_thermal_mass(inputfile(tm_key,1.0));
+       new_mat->set_heat_factor(inputfile(hf_key,1.0));
+       new_mat->set_thermal_expansivity(inputfile(alpha_key,1e-6));
+       new_mat->set_conductivity(inputfile(c_key,1e-5));
+       new_mat->set_electromigration_param(inputfile(z_key,1e-4)); 
+       new_mat->set_surface_diffusivity(inputfile(ds_key,1)); 
+       new_mat->set_surface_electromigration_param(inputfile(zs_key,1e-4)); 
+       new_mat->set_surface_strain_energy_param(inputfile(es_key,1e-3)); 
+       new_mat->set_surface_reaction_param(inputfile(rs_key,1e-3));
+       new_mat->set_surface_tension(inputfile(gamma_key,1.0));
+       new_mat->set_surface_thermomigration_param(inputfile(qs_key,0.0));
+       new_mat->set_thermomigration_param(inputfile(q_key,0.0));
+       
+
+       
+       if(!_anisotropy) 
+	 {
+	   Real diff= new_mat->get_diffusivity(); 
+	   RealTensor diffT(
+			    diff,
+			    0.0,
+			    0.0,
+			    0.0,
+			    diff,
+			    0.0,
+			    0.0,
+			    0.0,
+			    diff
+			    );
+	   new_mat->set_diffusivity_tensor(diffT); 
+	 }
+
+       
+       
+
+       if (_dim==2)
+	 {
+	   RealTensor diffT(inputfile(td_key,0.1,0),
+			    inputfile(td_key,0.0,2),
+			    0.0,
+			    inputfile(td_key,0.0,2),
+			    inputfile(td_key,0.1,1),
+			    0.0,
+			    0.0,
+			    0.0,
+			    1.0);
+	   libMesh::out<<"diffusivity tensor"<<std::endl;
+	   libMesh::out<<diffT<<std::endl;
+	 new_mat->set_diffusivity_tensor(diffT);
+	 }
+       else
+	 {
+	   RealTensor diffT(inputfile(td_key,0.1,0),
+			    inputfile(td_key,0.0,5),
+			    inputfile(td_key,0.0,4),
+			    inputfile(td_key,0.0,5),
+			    inputfile(td_key,0.1,1),
+			    inputfile(td_key,0.0,3),
+			    inputfile(td_key,0.0,4),
+			    inputfile(td_key,0.0,3),
+			    inputfile(td_key,0.1,2)
+			    );
+
+	   new_mat->set_diffusivity_tensor(diffT);
+	   
+	   libMesh::out<<"diffusivity tensor"<<std::endl;
+	   libMesh::out<<diffT<<std::endl;
+	 }
+       
+       _materials.insert(std::make_pair(mat_name,*new_mat));
+       
+     }
+   
+   
+
+   std::ostringstream temp; 
+       
+   temp.width(1); 
+   std::map<std::string,Diffusion*>::iterator diff_it = _diffusions.begin(); 
+   const std::map<std::string,Diffusion*>::iterator diff_it_end = _diffusions.end();
+   std::map<std::string,InitialConcentration*>::iterator init_it = _initial_concentrations.begin(); 
+ 
+
+   
+   for (;diff_it!=diff_it_end;diff_it++,init_it++) 
+     {
+       std::stringstream ss; 
+       
+       ss<<"diffusion/"<<diff_it->first;
+       unsigned int n_dbcs = inputfile(ss.str()+std::string("/n_dbcs"),0); 
+       libMesh::out<<"diffusion boundary conditions"<<n_dbcs<<std::endl;
+       
+       if (n_dbcs >0) 
+	 {
+	   for (unsigned int i=0; i<n_dbcs;i++)
+	     {
+	       libMesh::out<<"diffusion boundary conditions"<<std::endl;
+	       temp<<i+1; 
+	       std::string bc_key = ss.str()+std::string("/dbc")+temp.str();
+	       std::string bc_side=inputfile(bc_key,std::string("0"),0); 
+	       Real bc_val = inputfile(bc_key,0.0,1); 
+	       libMesh::out<<bc_val<<std::endl;
+	       boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side); 
+	       libMesh::out<<b_id<<bc_val<<std::endl;
+	       //     diff_it->second->get_penalty_parameter(inputfile(bc_key,1e10,2));
+	       diff_it->second->add_dirichlet_boundary_condition(b_id,
+								 bc_val);	
+	       init_it->second->add_dirichlet_boundary_condition(b_id,
+								 bc_val);
+
+	       temp.str(std::string());
+	     }
+	 }
+       
+       unsigned int n_nbcs = inputfile(ss.str()+std::string("/nnbcs"),0); 
+       if(n_nbcs >0 ) 
+	 {
+	   for (unsigned int i=0; i<n_nbcs; i++) 
+	     {
+	       temp<<i+1 ; 
+	       std::string bc_key = ss.str()+std::string("nbc")+temp.str(); 
+	       std::string bc_side = inputfile(bc_key,std::string("0"),0); 
+	       RealGradient flux ; 
+	       for (unsigned int j=0;j<_dim; j++) 
+		 {
+		   flux(j) = inputfile(bc_key,0.0,1+j); 
+		 }
+	       bc_key = ss.str()+std::string("nbc_scalar")+temp.str(); 
+	       Real value = inputfile(bc_key,0.0,1); 
+	       boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+	       
+	       diff_it->second->add_neumann_boundary_condition(b_id,
+							       flux,
+							       value);
+	       
+	       init_it->second->add_neumann_boundary_condition(b_id,
+							       flux,
+							       value);
+	       temp.str(std::string());
+	     }
+	 }
+     }
+   libMesh::out<<"Read the ch neumann boundary conditions " <<std::endl;
+   std::map<std::string,LinearCahnHilliard*>::iterator ch_it = _linear_cahn_hilliards.begin(); 
+   const std::map<std::string,LinearCahnHilliard*>::iterator ch_it_end = _linear_cahn_hilliards.end(); 
+   for (;ch_it!=ch_it_end;++ch_it) 
+     {
+       std::stringstream ss; 
+       ss<<"cahn_hilliard/"<<ch_it->first;
+       libMesh::out<<ss.str()<<std::endl;
+       unsigned int n_nbcs = inputfile(ss.str()+std::string("/n_nbcs"),0,0); 
+       bool interpolated =inputfile(ss.str()+std::string("/n_nbcs"),false,1);
+       bool implicit     =inputfile(ss.str()+std::string("/n_nbcs"),false,2); 
+       ch_it->second->set_interpolated_contact_boundary(interpolated); 
+       ch_it->second->set_implicit_contact_boundary(implicit);
+       if (n_nbcs > 0) 
+	 {
+	   _contact_angle_boundary=true; 
+	   for (unsigned int i=0; i<n_nbcs; i++) 
+	     {
+	       temp<<i+1; 
+	       std::string bc_key = ss.str()+std::string("/nbc")+temp.str(); 
+	       std::string bc_side = inputfile(bc_key,std::string("0"),0); 
+	       libMesh::out<<"bc_side"<<bc_side;
+	       Number contact_angle= inputfile(bc_key,45.0,1); 
+	       Number surface_energy = inputfile(bc_key,1.0,2); 
+	       boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side); 
+	       
+	       ch_it->second->add_contact_boundary_condition(b_id,
+							     contact_angle,
+							     surface_energy);
+	     
+	      
+	       temp.str(std::string());
+	     }
+	 }
+     }
+   libMesh::out<<"cahn hilliard contact conditions"<<_contact_angle_boundary<<std::endl;
+   
+
+   
+   libMesh::out<<"read the electrical boundary conditions :dirichlet "<<std::endl;
+   /// Read the properties for the electrical problem 
+   unsigned int n_dbcs = inputfile("electrical/n_dbcs",0);
+   if (n_dbcs>0) 
+     {
+       for (unsigned int i=0;i<n_dbcs; i++) 
+	 {
+	   temp<<i+1;
+	   std::string bc_key=std::string("electrical/dbc")+temp.str(); 
+	  
+	   std::string bc_side=inputfile(bc_key," ",0);
+	   Real bc_val = inputfile(bc_key,0.0,1); 
+	  
+	   boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+	   _electrical->add_dirichlet_boundary_condition(b_id,
+							 bc_val); 
+	   
+	   temp.str(std::string()); 
+	 }
+     }
+   unsigned int n_nbcs = inputfile("electrical/n_nbcs",0);
+
+   if (n_nbcs>0)
+     {
+       libMesh::out<<"read the electrical boundary conditions : neumann "<<std::endl;
+       for (unsigned int i=0; i<n_nbcs; i++) 
+	 {
+	   temp<<i;
+	   std::string bc_key=std::string("electrical/nbc_vec")+temp.str(); 
+	   std::string bc_side=inputfile(bc_key," ",0); 
+	   RealGradient flux;
+	   for(unsigned int j=0; j<_dim; j++) 
+	     flux(j) = inputfile(bc_key,0.0,1+j); 
+	   
+	   bc_key = std::string("electrical/nbc_scalar")+temp.str();
+	   bc_side = inputfile(bc_key," ",0);
+	   Real value = inputfile(bc_key,0.0,1); 
+	   
+	   boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+	   _electrical->add_neumann_boundary_condition(b_id, 
+						       flux,
+						       value);
+	   
+	   temp.str(std::string()); 
+	 }
+     }
+   
+
+   libMesh::out<<"read the thermal boundary conditions :dirichlet "<<std::endl;
+   /// Read the properties for the electrical problem 
+   n_dbcs = inputfile("thermal/n_dbcs",0);
+   if (n_dbcs>0) 
+     {
+       for (unsigned int i=0;i<n_dbcs; i++) 
+	 {
+	   temp<<i+1;
+	   std::string bc_key=std::string("thermal/dbc")+temp.str(); 
+	  
+	   std::string bc_side=inputfile(bc_key," ",0);
+	   Real bc_val = inputfile(bc_key,0.0,1); 
+	  
+	   boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+	   _thermal->add_dirichlet_boundary_condition(b_id,
+							 bc_val); 
+	   
+	   temp.str(std::string()); 
+	 }
+     }
+   n_nbcs = inputfile("thermal/n_nbcs",0);
+
+   if (n_nbcs>0)
+     {
+       libMesh::out<<"read the thermal boundary conditions : neumann "<<std::endl;
+       for (unsigned int i=0; i<n_nbcs; i++) 
+	 {
+	   temp<<i;
+	   std::string bc_key=std::string("thermal/nbc_vec")+temp.str(); 
+	   std::string bc_side=inputfile(bc_key," ",0); 
+	   RealGradient flux;
+	   for(unsigned int j=0; j<_dim; j++) 
+	     flux(j) = inputfile(bc_key,0.0,1+j); 
+	   
+	   bc_key = std::string("thermal/nbc_scalar")+temp.str();
+	   bc_side = inputfile(bc_key," ",0);
+	   Real value = inputfile(bc_key,0.0,1); 
+	   
+	   boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+	   _thermal->add_neumann_boundary_condition(b_id, 
+						       flux,
+						       value);
+	   
+	   temp.str(std::string()); 
+	 }
+     }
+   
+   unsigned int n_cbcs = inputfile("thermal/n_cbcs",0);
+   if (n_cbcs>0)
+     {
+       libMesh::out<<"read the thermal boundary conditions : convection "<<std::endl;
+       for (unsigned int i=0; i<n_cbcs; i++) 
+	 {
+	   temp<<i+1;
+	   std::string bc_key=std::string("thermal/cbc")+temp.str(); 
+	   std::string bc_side=inputfile(bc_key," ",0); 
+	   // Coefficient of convection
+	   Real co_eff = inputfile(bc_key,0.0,1); 
+	   
+	   // Ambient temperature to which heat is being transferred
+	   Real a_T    = inputfile(bc_key,0.0,2);
+
+	   boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+	   _thermal->add_convection_boundary_condition(b_id, 
+						       a_T,
+						       co_eff);
+	   
+	   temp.str(std::string()); 
+	 }
+     }
+
+
+
+
+
+
+   
+   //
+   
+   libMesh::out<<"read the stress boundary conditions: dirichlet "<<std::endl;
+   n_dbcs = inputfile("stress/n_dbcs",0);
+  
+   
+   for (unsigned int i=0;i<n_dbcs; i++) 
+     {
+       temp <<i+1; 
+       // lets do component value..
+       // for xy and z components.  so yes , value , no, 0, yes , value
+       std::string bc_key=std::string("stress/dbc")+temp.str(); 
+       std::vector<std::string> components;
+       std::vector<Real> values(3);
+       std::string bc_side=inputfile(bc_key," ",0); 
+      
+       
+
+       for (unsigned int i=1; i<_dim+1;i++)
+	 {
+	   values[i-1]=inputfile(bc_key,0.0,i);
+	 }
+       
+       std::string x = inputfile(bc_key,std::string("no"),_dim+1);
+       if (x =="yes") 
+	 components.push_back("x"); 
+       std::string y = inputfile(bc_key,std::string("no"),_dim+2);
+       if (y =="yes") 
+	 components.push_back("y"); 
+       std::string z = inputfile(bc_key,std::string("no"),_dim+3); 
+       if (z=="yes") 
+	 components.push_back("z"); 
+       libMesh::out<<"side"<<bc_side<<"\t";
+       
+
+       RealGradient value(values[0],values[1],values[2]); 
+       libMesh::out<<value<<"\n";
+       boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+       _stress_solver->add_dirichlet_boundary_condition(b_id,
+ 						       components, 
+ 						       value); 
+       temp.str(std::string());
+     }
+
+   libMesh::out<<"read the stress boundary conditions: neumann "<<std::endl;
+   n_nbcs = inputfile("stress/n_nbcs",0);
+   //
+   for (unsigned int i=0; i<n_nbcs; i++) 
+     {
+       temp << i+1; 
+       std::string bc_key=std::string("stress/nbc")+temp.str(); 
+       std::string bc_side=inputfile(bc_key," ",0);
+       
+      
+      
+      
+
+ 
+       boundary_id_type b_id = _mesh->boundary_info->get_id_by_name(bc_side);
+
+       RealGradient flux;
+       for(unsigned int j=0; j<_dim; j++) 
+	 flux(j) = inputfile(bc_key,0.0,1+j); 
+       
+       _stress_solver->add_neumann_boundary_condition(b_id, 
+ 						     flux);
+       temp.str(std::string());
+     }
+   
+   libMesh::out<<"Read the invariants which are to be computed" ;
+   unsigned int n_invar = inputfile("stress/invar",0,0); 
+   for(unsigned int i=0; i< n_invar;i++) 
+     {
+       std::string invar_name = inputfile("stress/invar",std::string(""),i+1);
+       if(invar_name != std::string(""))
+	 _stress_system->add_invariants(invar_name); 
+     } 
+ 
+
+   
+   libMesh::out<<"Read the interfacial averaging parameters"<<std::endl; 
+   Real alpha = inputfile("int_av/alpha",1.0); 
+   Real beta  = inputfile("int_av/beta",0.001); 
+   Real int_param = inputfile("int_av/int_param",0.2); 
+   InterfacialAverage::set_alpha(alpha); 
+   InterfacialAverage::set_beta(beta); 
+   InterfacialAverage::set_int_slope(int_param); 
+  
+  
+
+ 
+ }
+
+    
+
+void DiffCode::run()
+{
+
+  //  print_info();
+  _t = _t0;
+  Number o_t= 0.0; 
+  int timestep =0; 
+
+  output(timestep,_t,o_t,true); 
+  
+  //_cahn_hilliard->set_beta_w(1.0);
+  while (_t < _tf)
+   {
+     ++timestep; 
+     step(); 
+     if ((timestep > _first_order_steps)&& 
+	 _second_order_solution) 
+       {
+	 _second_order_switch = true; 
+       }
+     libMesh::out<<"solving for state "<<timestep<<", time "<<_t<<std::endl;
+     
+     _t += _dt; 
+     
+     output(timestep,_t,o_t); 
+     
+   }
+}
+
+
+DiffCode::DiffCode(Mesh* mesh):
+  EquationSystems(*mesh),
+  _mesh(mesh),
+   abq_io(*mesh)  
+{
+  libMesh::out<<"diffCode 1.0 "<<std::endl; 
+  std::string inp_file; 
+  // Set the mesh refinement object. 
+  _mesh_refinement = new MeshRefinement(*mesh); 
+ 
+  inp_file= command_line_value("--inp",std::string("default")); 
+  libMesh::out<<"inp_file"<<inp_file<<""<<std::endl;
+ 
+  if (inp_file==std::string("default"))
+    {
+      libMesh::out<<"Sorry - won't work without the input file"<<std::endl; 
+      libMesh::out <<"exiting the code now"<<std::endl;
+      exit(0);
+    }
+    
+  _diff_init=true;
+  //_dim = command_line_value("--dim",3);
+  _ex_io = new ExodusII_IO(*_mesh);
+  read_input_file(inp_file); 
+  return; 
+}
+
+
+void DiffCode::DiffCode::construct_active_subdomain_set()
+{
+  std::map<subdomain_id_type,std::string>::iterator it; 
+  _active_subdomains.insert(_mesh->get_id_by_name(_active_set)); 
+}
+
+std::string DiffCode::DiffCode::form_system_name(
+						  const std::string& system_type,
+						  const std::string& subdomain_name
+						  )
+{
+  std::stringstream ss; 
+  ss<<system_type; 
+  ss<<"_"; 
+  ss<<subdomain_name; 
+  return ss.str(); 
+}
+
+
+std::string DiffCode::DiffCode::split_system_name(
+						  const std::string& system_type, 
+						  const std::string& system_name
+						  )
+{
+  unsigned int system_type_size = system_type.size()+1; 
+  std::string sub_str = system_name.substr(system_type_size,std::string::npos);
+  return sub_str; 
+}
+
+void DiffCode::DiffCode::_select_output_systems()
+{
+
+  // The basic ones are the electrical,collated phase field, 
+  // stress solver stress system, 
+  // I think I will 
+  
+  if(_electrical) 
+    _output_systems.insert("DiffCode::elec"); 
+  if(_stress_system) 
+    _output_systems.insert("DiffCode::stress_system"); 
+  if(_stress_solver)
+    _output_systems.insert("DiffCode::stress_solver"); 
+  if(_collated_phase_field)
+    _output_systems.insert("DiffCode::collated_phase_field"); 
+  if (_thermal) 
+    _output_systems.insert("DiffCode::thermal");
+
+  if (_output_everything) 
+    {
+      
+      std::map<std::string,LinearCahnHilliard*>::iterator ch_it = _linear_cahn_hilliards.begin(); 
+      const std::map<std::string,LinearCahnHilliard*>::iterator ch_it_end = _linear_cahn_hilliards.end(); 
+
+      std::map<std::string,Diffusion*>::iterator diff_it = _diffusions.begin(); 
+      const std::map<std::string,Diffusion*>::iterator diff_it_end = _diffusions.end(); 
+  
+      std::map<std::string,InterfacialAverage*>::iterator iav_it = _interfacial_averages.begin(); 
+      const std::map<std::string,InterfacialAverage*>::iterator iav_it_end = _interfacial_averages.end(); 
+
+      std::map<std::string,OtherResults*>::iterator ores_it = _other_results_map.begin(); 
+      const std::map<std::string,OtherResults*>::iterator ores_it_end = _other_results_map.end(); 
+      
+      std::map<std::string,InitialConcentration*>::iterator init_it = _initial_concentrations.begin(); 
+      const std::map<std::string,InitialConcentration*>::iterator init_it_end = _initial_concentrations.end(); 
+
+      
+
+      for (;ch_it!=ch_it_end;ch_it++)
+	_output_systems.insert(ch_it->second->name()); 
+      for (;diff_it!=diff_it_end;diff_it++) 
+	_output_systems.insert(diff_it->second->name()); 
+      for(;iav_it!=iav_it_end;iav_it++) 
+	_output_systems.insert(iav_it->second->name()); 
+      for(;ores_it!=ores_it_end;ores_it++) 
+	_output_systems.insert(ores_it->second->name()); 
+      for(;init_it!=init_it_end;init_it++) 
+	_output_systems.insert(init_it->second->name());
+
+    }
+}
+
+
+void DiffCode::DiffCode::output(int timestep,
+				const Real& t, 
+				Real& o_t, 
+				bool force)
+
+{
+  ++_o_count; 
+ 
+  std::stringstream ss; 
+  
+  ss<<_out_file;
+  ss<<timestep; 
+  ss<<".e";
+
+  if(timestep%_ofreq==0)  
+    {
+     
+      ExodusII_IO(*_mesh).write_equation_systems(ss.str(),  *this,&_output_systems); 
+      Number resistance,current,delta_v; 
+      
+      _electrical->compute_resistance(
+				      current,
+				      delta_v,
+				      resistance,
+				      _resistance_side_1,
+				      _resistance_side_2
+				      );
+      _volt_file<<_t<<"\t"<<current<<"\t"<<delta_v<<"\t"<<resistance<<std::endl;
+      
+      std::map<std::string,LinearCahnHilliard*>::iterator ch_it = _linear_cahn_hilliards.begin(); 
+      const std::map<std::string,LinearCahnHilliard*>::iterator ch_it_end = _linear_cahn_hilliards.end(); 
+      
+      for (;ch_it!=ch_it_end;++ch_it)
+	{
+
+	  Point com(0.0,0.0,0.0); 
+	  Number value = 0.0; 
+	  ch_it->second->get_center_of_mass_and_volume(com,value); 
+	  std::stringstream line_stream;
+	  
+	  line_stream<<std::fixed;
+	  line_stream<<std::setprecision(6);
+	  line_stream<<_t<<"\t"<<com(0)<<"\t"<<com(1)<<"\t"<<com(2)<<"\t"<<value<<"\n";
+	  
+	  _output_files[ch_it->first]->write(line_stream.str().c_str(),
+					     line_stream.str().length());
+	  _output_files[ch_it->first]->flush();
+	}
+    }
+}
+
+
+
+void DiffCode::DiffCode::_initial_uniform_refinement()
+{
+  unsigned int n_levs = _n_levels_init_uniform_refinement;
+ 
+  libMesh::out<<"levels of initial refinement"<<n_levs<<std::endl;
+  for (unsigned int i=0;i<n_levs;i++)
+    {
+      MeshBase::const_element_iterator el = _mesh->active_local_elements_begin(); 
+      const MeshBase::const_element_iterator end_el = _mesh->active_local_elements_end();
+      
+      for (;el !=end_el; ++el)
+	{
+	  Elem* elem = *el; 
+	  subdomain_id_type sub_id = elem->subdomain_id();
+	  if (_collated_phase_field->check_subdomain_inclusion(sub_id))
+	    {
+	      elem->set_refinement_flag(Elem::REFINE);
+	    }
+	}
+      _mesh_refinement->refine_and_coarsen_elements() ;
+      //  this->EquationSystems::reinit(); 
+      _mesh->print_info();
+      
+    }
+}
+
+
